@@ -43,6 +43,7 @@ pub use sketch_modify::trim_piece;
 mod component_link;
 mod config;
 mod file;
+mod gears;
 mod inspect;
 mod interference;
 pub(crate) mod joints;
@@ -283,6 +284,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(motion::COMMANDS.iter());
     v.extend(config::COMMANDS.iter());
     v.extend(parts::COMMANDS.iter());
+    v.extend(gears::COMMANDS.iter());
     v.extend(bom::COMMANDS.iter());
     v.extend(browser::COMMANDS.iter());
     v.extend(delete::COMMANDS.iter());

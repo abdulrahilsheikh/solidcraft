@@ -1199,7 +1199,11 @@ fn component_rows_inner(
     }
     if r.double {
         if app.session.doc.parts.contains_key(&id) {
-            crate::dialogs_part_size::open(app, id);
+            if app.session.doc.parts.get(&id).is_some_and(|part| part.family == "spur_gear") {
+                crate::dialogs_gears::open(app, id);
+            } else {
+                crate::dialogs_part_size::open(app, id);
+            }
         } else {
             let _ = app.run("component.activate", json!({ "component": id }));
         }
@@ -1329,7 +1333,11 @@ fn occurrence_rows_inner(
         let _ = app.run("component.activate", json!({"component": placement.component, "occurrence": placement.occurrence, "path": path}));
     }
     if r.double && app.session.doc.parts.contains_key(&placement.component) {
-        crate::dialogs_part_size::open(app, placement.component);
+        if app.session.doc.parts.get(&placement.component).is_some_and(|part| part.family == "spur_gear") {
+            crate::dialogs_gears::open(app, placement.component);
+        } else {
+            crate::dialogs_part_size::open(app, placement.component);
+        }
     }
     if r.clicked {
         click_select(app, ui, key.clone(), Some(Sel::Occurrence { path: path.to_vec() }));

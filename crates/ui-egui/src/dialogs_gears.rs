@@ -25,7 +25,6 @@ pub struct Form {
     pub helix_angle: String,
     pub num_points: String,
     pub simple: bool,
-    pub undercut: bool,
     pub double_helix: bool,
     pub axle_hole: bool,
     pub offset_hole: bool,
@@ -54,7 +53,6 @@ impl Form {
             helix_angle: "90".into(),
             num_points: "20".into(),
             simple: false,
-            undercut: false,
             double_helix: false,
             axle_hole: true,
             offset_hole: false,
@@ -97,7 +95,6 @@ impl Form {
             helix_angle: get("ha", "90"),
             num_points: get("np", "20"),
             simple: get("sm", "false") == "true",
-            undercut: get("uc", "false") == "true",
             double_helix: get("dh", "false") == "true",
             axle_hole: get("ah", "true") == "true",
             offset_hole: get("oh", "false") == "true",
@@ -127,7 +124,6 @@ impl Form {
             self.helix_angle.clone(),
             self.num_points.clone(),
             self.simple.to_string(),
-            self.undercut.to_string(),
             self.double_helix.to_string(),
             self.axle_hole.to_string(),
             self.offset_hole.to_string(),
@@ -173,7 +169,6 @@ impl Form {
             "helix_angle": parse("Helix angle", &self.helix_angle)?,
             "num_points": parse("Profile accuracy", &self.num_points)?,
             "simple": self.simple,
-            "undercut": self.undercut,
             "double_helix": self.double_helix,
             "axle_hole": self.axle_hole,
             "offset_hole": self.offset_hole,
@@ -232,7 +227,6 @@ pub fn rows(_app: &mut SolveApp, ui: &mut egui::Ui, form: &mut Form) -> bool {
     row(ui, "Head tolerance (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.head_tolerance, "e.g. 0").0);
     row(ui, "Root fillet radius (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.root_fillet_radius, "0 for none").0);
     row(ui, "Head fillet radius (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.head_fillet_radius, "0 for none").0);
-    row(ui, "Undercut relief", |ui| ui.checkbox(&mut form.undercut, "").changed());
     row(ui, "Profile accuracy points", |ui| crate::ui_kit::text_field(ui, &mut form.num_points, "4 to 24").0);
     row(ui, "Simple profile", |ui| ui.checkbox(&mut form.simple, "").changed());
     row(ui, "Helix angle (deg)", |ui| crate::ui_kit::text_field(ui, &mut form.helix_angle, "90 straight, <90 helical; max 24 teeth").0);
@@ -335,7 +329,6 @@ mod tests {
         form.pressure_angle = "25".into();
         form.backlash = "-0.1".into();
         form.root_fillet_radius = "0.4".into();
-        form.undercut = true;
         form.double_helix = true;
         form.axle_hole = false;
         form.offset_hole = true;
@@ -367,7 +360,7 @@ mod tests {
         assert_eq!(form.pressure_angle, "25");
         assert_eq!(form.backlash, "-0.1");
         assert_eq!(form.root_fillet_radius, "0.4");
-        assert!(form.undercut && form.double_helix && form.simple);
+        assert!(form.double_helix && form.simple);
         assert!(!form.axle_hole && form.offset_hole && form.reversed_backlash);
         assert_eq!(form.offset_hole_offset, "5");
         assert_eq!(form.offset_hole_size, "2");
@@ -402,7 +395,7 @@ mod tests {
         assert_eq!(form.backlash, "-0.2");
         assert_eq!(form.root_fillet_radius, "0.1");
         assert_eq!(form.helix_angle, "60");
-        assert!(form.undercut && form.double_helix && form.simple);
+        assert!(form.double_helix && form.simple);
         assert!(!form.axle_hole && form.offset_hole && form.reversed_backlash);
         assert_eq!(form.offset_hole_offset, "5");
         assert_eq!(form.offset_hole_size, "2");

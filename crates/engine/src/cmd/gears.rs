@@ -15,7 +15,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("gears.insert", "Insert Spur Gear", insert)
         .at("INSERT", "LIBRARY")
         .icon("gear")
-        .params("module, teeth, height? (or face_width), bore?, pressure_angle?, backlash?, reversed_backlash?, clearance?, head_tolerance?, profile_shift?, num_points?, simple?, undercut?, root_fillet_radius?, head_fillet_radius?, helix_angle? (90° is straight), double_helix?, axle_hole?, axle_hole_size?, offset_hole?, offset_hole_offset?, offset_hole_size?, point?, name?"),
+        .params("module, teeth, height? (or face_width), bore?, pressure_angle?, backlash?, reversed_backlash?, clearance?, head_tolerance?, profile_shift?, num_points?, simple?, root_fillet_radius?, head_fillet_radius?, helix_angle? (90° is straight), double_helix?, axle_hole?, axle_hole_size?, offset_hole?, offset_hole_offset?, offset_hole_size?, point?, name?"),
     CommandSpec::new("gears.resize", "Edit Gear Parameters", resize_atomic)
         .icon("scale")
         .params("component: id|name; editable gear parameters as gears.insert"),
@@ -34,7 +34,6 @@ struct Gear {
     helix_angle: f64,
     num_points: u32,
     simple: bool,
-    undercut: bool,
     double_helix: bool,
     axle_hole: bool,
     offset_hole: bool,
@@ -69,7 +68,6 @@ impl Gear {
             helix_angle,
             num_points: 20,
             simple: false,
-            undercut: false,
             double_helix: false,
             axle_hole: true,
             offset_hole: false,
@@ -223,7 +221,7 @@ impl Gear {
 
     fn encode(&self) -> String {
         format!(
-            "m={};z={};b={};pa={};bl={};fr={};ha={};hf={};np={};sm={};uc={};dh={};ah={};oh={};oho={};ohs={};ps={};cl={};ht={};rb={}",
+            "m={};z={};b={};pa={};bl={};fr={};ha={};hf={};np={};sm={};dh={};ah={};oh={};oho={};ohs={};ps={};cl={};ht={};rb={}",
             self.module,
             self.teeth,
             self.bore,
@@ -234,7 +232,6 @@ impl Gear {
             self.head_fillet_radius,
             self.num_points,
             self.simple,
-            self.undercut,
             self.double_helix,
             self.axle_hole,
             self.offset_hole,
@@ -287,7 +284,6 @@ impl Gear {
         gear.head_fillet_radius = extra.get("hf").and_then(|value| value.parse().ok()).unwrap_or(0.0);
         gear.num_points = extra.get("np").and_then(|value| value.parse().ok()).unwrap_or(20);
         gear.simple = extra.get("sm").is_some_and(|value| *value == "true");
-        gear.undercut = extra.get("uc").is_some_and(|value| *value == "true");
         gear.double_helix = extra.get("dh").is_some_and(|value| *value == "true");
         gear.axle_hole = extra.get("ah").map_or(true, |value| *value == "true");
         gear.offset_hole = extra.get("oh").is_some_and(|value| *value == "true");
@@ -325,7 +321,6 @@ fn library(_s: &mut Session, p: &Value) -> Result<Value> {
             "helix_angle": 90.0,
             "num_points": 20,
             "simple": false,
-            "undercut": false,
             "double_helix": false,
             "axle_hole": true,
             "axle_hole_size": 8.0,
@@ -363,6 +358,9 @@ fn library(_s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn read_gear(p: &Value, previous: Option<&Gear>) -> Result<Gear> {
+    if p.get("undercut").is_some() {
+        return Err(bad("gears", "`undercut` is not implemented"));
+    }
     let get = |key: &str, default: f64| num(p, key).unwrap_or(default);
     let get_alias = |key: &str, alias: &str, default: f64| num(p, key).or_else(|| num(p, alias)).unwrap_or(default);
     let flag = |key: &str, default: bool| -> Result<bool> {
@@ -402,7 +400,6 @@ fn read_gear(p: &Value, previous: Option<&Gear>) -> Result<Gear> {
     }
     gear.num_points = points as u32;
     gear.simple = flag("simple", previous.is_some_and(|g| g.simple))?;
-    gear.undercut = flag("undercut", previous.is_some_and(|g| g.undercut))?;
     gear.double_helix = flag("double_helix", previous.is_some_and(|g| g.double_helix))?;
     let default_axle_hole = previous.map_or(true, |g| g.axle_hole);
     gear.axle_hole = flag("axle_hole", if p.get("bore").is_some() && p.get("axle_hole_size").is_none() { bore > 0.0 } else { default_axle_hole })?;
@@ -542,34 +539,12 @@ fn one_tooth_with_resolution(g: &Gear, involute_segments: usize, tip_arc_segment
     // the root cylinder, where the tooth overlaps the cylinder.
     if rf < rb {
         let root_point = [rf * left_base_angle.cos(), rf * left_base_angle.sin()];
-        if g.undercut {
-            let root_fillet = if g.root_fillet_radius > 0.0 {
-                root_fillet_points(rf, left_base_angle, -1.0, g.root_fillet_radius, fillet_segments)
-            } else {
-                vec![root_point]
-            };
-            pts.extend(root_fillet.iter().copied());
-            let relief_start = root_fillet.last().copied().unwrap_or(root_point);
-            let base = left[0];
-            let tangent = [left[1][0] - base[0], left[1][1] - base[1]];
-            let length = tangent[0].hypot(tangent[1]).max(1e-9);
-            let relief = bezier_points(
-                relief_start,
-                [relief_start[0] + g.module * left_base_angle.cos() * 0.25, relief_start[1] + g.module * left_base_angle.sin() * 0.25],
-                [base[0] - tangent[0] / length * g.module * 0.25, base[1] - tangent[1] / length * g.module * 0.25],
-                base,
-                fillet_segments.max(4),
-            );
-            pts.extend(relief.into_iter().skip(1));
-            pts.extend(left.iter().copied().skip(1));
+        if g.root_fillet_radius > 0.0 {
+            pts.extend(root_fillet_points(rf, left_base_angle, -1.0, g.root_fillet_radius, fillet_segments));
         } else {
-            if g.root_fillet_radius > 0.0 {
-                pts.extend(root_fillet_points(rf, left_base_angle, -1.0, g.root_fillet_radius, fillet_segments));
-            } else {
-                pts.push(root_point);
-            }
-            pts.extend(left.iter().copied());
+            pts.push(root_point);
         }
+        pts.extend(left.iter().copied());
     } else {
         pts.extend(left.iter().copied());
     }
@@ -597,26 +572,7 @@ fn one_tooth_with_resolution(g: &Gear, involute_segments: usize, tip_arc_segment
 
     if rf < rb {
         let root_point = [rf * right_base_angle.cos(), rf * right_base_angle.sin()];
-        if g.undercut {
-            let base = right[0];
-            let tangent = [right[1][0] - base[0], right[1][1] - base[1]];
-            let length = tangent[0].hypot(tangent[1]).max(1e-9);
-            let root_fillet = if g.root_fillet_radius > 0.0 {
-                root_fillet_points(rf, right_base_angle, 1.0, g.root_fillet_radius, fillet_segments)
-            } else {
-                vec![root_point]
-            };
-            let relief_end = root_fillet.last().copied().unwrap_or(root_point);
-            let relief = bezier_points(
-                base,
-                [base[0] - tangent[0] / length * g.module * 0.25, base[1] - tangent[1] / length * g.module * 0.25],
-                [relief_end[0] - g.module * right_base_angle.cos() * 0.25, relief_end[1] - g.module * right_base_angle.sin() * 0.25],
-                relief_end,
-                fillet_segments.max(4),
-            );
-            pts.extend(relief.into_iter().skip(1));
-            pts.extend(root_fillet.into_iter().rev().skip(1));
-        } else if g.root_fillet_radius > 0.0 {
+        if g.root_fillet_radius > 0.0 {
             pts.extend(root_fillet_points(rf, right_base_angle, 1.0, g.root_fillet_radius, fillet_segments).into_iter().rev().skip(1));
         } else {
             pts.push(root_point);
@@ -660,20 +616,6 @@ fn one_tooth_with_resolution(g: &Gear, involute_segments: usize, tip_arc_segment
     }
 
     Ok(clean)
-}
-
-#[cfg(test)]
-fn bezier_points(start: [f64; 2], c1: [f64; 2], c2: [f64; 2], end: [f64; 2], segments: usize) -> Vec<[f64; 2]> {
-    (0..=segments)
-        .map(|i| {
-            let t = i as f64 / segments as f64;
-            let u = 1.0 - t;
-            [
-                u.powi(3) * start[0] + 3.0 * u.powi(2) * t * c1[0] + 3.0 * u * t.powi(2) * c2[0] + t.powi(3) * end[0],
-                u.powi(3) * start[1] + 3.0 * u.powi(2) * t * c1[1] + 3.0 * u * t.powi(2) * c2[1] + t.powi(3) * end[1],
-            ]
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -877,34 +819,47 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     )?;
 
     let flank_length = polyline_length(&flank);
-    let root_lead = if g.root_fillet_radius > 0.0 { 2.0 * g.root_fillet_radius } else { 0.0 };
     let head_lead = if g.head_fillet_radius > 0.0 { 2.0 * g.head_fillet_radius } else { 0.0 };
-    if root_lead + head_lead >= flank_length {
-        return Err(bad("gears", "the requested root and head fillets do not fit along the involute"));
+
+    if head_lead >= flank_length {
+        return Err(bad("gears", "the requested head fillet does not fit along the involute"));
     }
-    let root_contact =
-        point_at_polyline_distance(&flank, root_lead).ok_or_else(|| bad("gears", "the involute root contact could not be calculated"))?;
+
     let head_contact = point_at_polyline_distance(&flank, flank_length - head_lead)
         .ok_or_else(|| bad("gears", "the involute head contact could not be calculated"))?;
-    if g.root_fillet_radius > 0.0 {
-        run(s, "sketch.line", json!({"points": ["gear_root_arc.end", root_contact], "closed": false, "ids": ["gear_root_bridge"]}))?;
-    }
+
+    // Fixed straight line: its endpoint does not depend on the root fillet radius.
+    run(
+        s,
+        "sketch.line",
+        json!({
+            "points": ["gear_root_arc.end", base],
+            "closed": false,
+            "ids": ["gear_root_bridge"]
+        }),
+    )?;
+
+    // The spline always starts at the base point.
     let mut fit_values = Vec::with_capacity(flank.len() + 1);
-    fit_values.push(json!(if g.root_fillet_radius > 0.0 { "gear_root_bridge.end" } else { "gear_root_arc.end" }));
+    fit_values.push(json!(base));
+
     let mut distance = 0.0;
     for (index, pair) in flank.windows(2).enumerate() {
         distance += (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
-        if distance > root_lead && distance < flank_length - head_lead {
+
+        if distance > 0.0 && distance < flank_length - head_lead {
             if let Some(point) = flank.get(index + 1) {
                 fit_values.push(json!(point));
             }
         }
     }
+
     if g.head_fillet_radius > 0.0 {
         fit_values.push(json!(head_contact));
-    } else if let Some(point) = flank.last() {
-        fit_values.push(json!(point));
+    } else {
+        fit_values.push(json!(tip));
     }
+
     if fit_values.len() < 2 {
         return Err(bad("gears", "the involute needs at least two fit points"));
     }
@@ -933,7 +888,14 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         }),
     )?;
     if g.root_fillet_radius > 0.0 {
-        run(s, "sketch.fillet", json!({"point": "gear_root_bridge.start", "radius": g.root_fillet_radius}))?;
+        run(
+            s,
+            "sketch.fillet",
+            json!({
+                "point": "gear_root_bridge.start",
+                "radius": g.root_fillet_radius
+            }),
+        )?;
     }
     if g.head_fillet_radius > 0.0 {
         run(s, "sketch.fillet", json!({"point": "gear_head_bridge.end", "radius": g.head_fillet_radius}))?;
@@ -943,6 +905,7 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         "sketch.line",
         json!({"points": ["gear_sector_boundary.start", [ra * 1.1, 0]], "closed": false, "construction": true, "ids": ["gear_mirror_axis"]}),
     )?;
+    run(s, "sketch.construction", json!({"curves": ["gear_sector_boundary"], "value": true}))?;
     let active = s.active_sketch.ok_or_else(|| bad("gears", "the gear sketch is not active"))?;
     let state = s.model.state();
     let sketch = state.sketch(active).ok_or_else(|| bad("gears", "the gear sketch is missing"))?;
@@ -954,32 +917,16 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     let active = s.active_sketch.ok_or_else(|| bad("gears", "the gear sketch is not active"))?;
     let state = s.model.state();
     let sketch = state.sketch(active).ok_or_else(|| bad("gears", "the gear sketch is missing"))?;
-    let splines: Vec<String> = sketch
-        .sketch
-        .curves
-        .iter()
-        .filter(|curve| !curve.construction && matches!(curve.kind, solidcraft_sketch::CurveKind::Spline { .. }))
-        .map(|curve| curve.id.clone())
-        .collect();
-    if !splines.is_empty() {
-        run(s, "sketch.constraint.fix", json!({"entities": splines}))?;
+    let pattern_entities: Vec<String> = sketch.sketch.curves.iter().filter(|curve| !curve.construction).map(|curve| curve.id.clone()).collect();
+    if !pattern_entities.is_empty() {
+        run(s, "sketch.constraint.fix", json!({"entities": pattern_entities}))?;
     }
+    run(s, "sketch.pattern.circular", json!({"entities": pattern_entities, "center": [0, 0], "count": g.teeth, "angle": 360, "associative": false}))?;
     run(s, "sketch.finish", json!({}))?;
     Ok(())
 }
 
-fn created_bodies(result: &Value) -> Result<Vec<String>> {
-    result
-        .get("created_bodies")
-        .and_then(Value::as_array)
-        .filter(|bodies| !bodies.is_empty())
-        .ok_or_else(|| bad("gears", "the gear sector feature created no bodies"))?
-        .iter()
-        .map(|body| body.as_str().map(str::to_string).ok_or_else(|| bad("gears", "the gear sector feature returned an invalid body name")))
-        .collect()
-}
-
-fn helical_sweep(s: &mut Session, g: &Gear, start: f64, end: f64, start_rotation: f64, twist: f64, suffix: &str, operation: &str) -> Result<Value> {
+fn helical_sweep(s: &mut Session, g: &Gear, start: f64, end: f64, start_rotation: f64, twist: f64, suffix: &str, operation: &str) -> Result<()> {
     let profile_name = format!("Gear profile {suffix}");
     let path_name = format!("Gear path {suffix}");
     let path_id = format!("gear_path_{suffix}");
@@ -997,19 +944,20 @@ fn helical_sweep(s: &mut Session, g: &Gear, start: f64, end: f64, start_rotation
             "twist": format!("{twist} rad"),
             "operation": operation,
             "name": format!("Helical gear {suffix}"),
-            "body_name": "Gear"
+            "body_name": "Gear",
         }),
     )
-    .map_err(|error| bad("gears", format!("helical sector sweep failed: {error}")))
+    .map_err(|error| bad("gears", format!("helical gear sweep failed: {error}")))?;
+    Ok(())
 }
 
 /// Build a gear at its local origin, with the bottom face at z = 0.
 fn build(s: &mut Session, g: &Gear) -> Result<()> {
     let _frame = crate::frames::local_geometry();
-    let pattern_bodies = if g.helix_angle == 90.0 {
+    if g.helix_angle == 90.0 {
         let profile_name = "Gear tooth profile";
         sector_sketch(s, g, 0.0, 0.0, profile_name)?;
-        let result = run(
+        run(
             s,
             "solid.extrude",
             json!({
@@ -1017,48 +965,27 @@ fn build(s: &mut Session, g: &Gear) -> Result<()> {
                 "distance": format!("{} mm", g.face_width),
                 "direction": "positive",
                 "operation": "new",
-                "name": "Tooth sector",
+                "name": "Gear",
                 "body_name": "Gear"
             }),
         )?;
-        created_bodies(&result)?
     } else if g.double_helix {
         let mid = g.face_width / 2.0;
         let half_twist = g.twist() / 2.0;
-        let first = helical_sweep(s, g, 0.0, mid, 0.0, half_twist, "first", "new")?;
-        let second = helical_sweep(s, g, mid, g.face_width, half_twist, -half_twist, "second", "new")?;
-        let mut bodies = created_bodies(&first)?;
-        bodies.extend(created_bodies(&second)?);
-        bodies
+        helical_sweep(s, g, 0.0, mid, 0.0, half_twist, "first", "new")?;
+        run(
+            s,
+            "solid.mirror",
+            json!({
+                "bodies": ["Gear"],
+                "plane": {"origin": [0, 0, mid], "normal": [0, 0, 1]},
+                "combine": true,
+                "name": "Join double-helix halves"
+            }),
+        )
+        .map_err(|error| bad("gears", format!("mirroring the double-helix half failed: {error}")))?;
     } else {
-        let result = helical_sweep(s, g, 0.0, g.face_width, 0.0, g.twist(), "single", "new")?;
-        created_bodies(&result)?
-    };
-    run(
-        s,
-        "solid.pattern.circular",
-        json!({
-            "bodies": pattern_bodies,
-            "axis": {"origin": [0, 0, 0], "dir": [0, 0, 1]},
-            "count": g.teeth,
-            "angle": 360,
-            "name": "Gear tooth pattern"
-        }),
-    )
-    .map_err(|error| bad("gears", format!("circular sector pattern failed: {error}")))?;
-    let state = s.model.state();
-    let tools: Vec<String> = state
-        .bodies
-        .iter()
-        .filter(|body| s.doc.model_body_component(body) == s.active_component && body.name != "Gear")
-        .map(|body| body.name.clone())
-        .collect();
-    if g.helix_angle < 90.0 && tools.is_empty() {
-        return Err(bad("gears", "the gear sector pattern produced no bodies to join"));
-    }
-    if !tools.is_empty() {
-        run(s, "solid.combine", json!({"target": "Gear", "tools": tools, "operation": "join", "name": "Join gear sectors"}))
-            .map_err(|error| bad("gears", format!("joining gear sectors failed: {error}")))?;
+        helical_sweep(s, g, 0.0, g.face_width, 0.0, g.twist(), "single", "new")?;
     }
 
     let mut holes = Vec::new();
@@ -1108,7 +1035,6 @@ fn gear_properties(g: &Gear) -> Value {
         "head_fillet_radius": g.head_fillet_radius,
         "helix_angle": g.helix_angle,
         "double_helix": g.double_helix,
-        "undercut": g.undercut,
         "offset_hole": g.offset_hole,
         "offset_hole_offset": g.offset_hole_offset,
         "offset_hole_size": g.offset_hole_size,
@@ -1302,16 +1228,49 @@ mod tests {
         assert!(measure.volume > 0.0);
         assert!((measure.bbox.max.z - 10.0).abs() < 1e-6);
         assert!(session.doc.features.iter().any(|feature| feature.kind.type_name() == "SweepFeature"));
+        assert!(
+            session
+                .doc
+                .features
+                .iter()
+                .any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sketch { sketch, .. } if !sketch.patterns.is_empty()))
+        );
+        assert!(!session.doc.features.iter().any(|feature| feature.kind.type_name() == "CircularPatternFeature"));
     }
 
     #[test]
-    fn gear_sector_profile_uses_sketch_fillets_and_patterns_one_sector() {
+    fn double_helix_mirrors_one_swept_half() {
+        let mut session = Session::default();
+        session
+            .execute("gears.insert", &json!({"module":2,"teeth":8,"height":6,"helix_angle":60,"double_helix":true,"num_points":4,"simple":true}))
+            .unwrap();
+
+        let sweeps = session.doc.features.iter().filter(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sweep { .. })).count();
+        assert_eq!(sweeps, 1);
+        assert!(session.doc.features.iter().any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Mirror { combine: true, .. })));
+
+        let state = session.world_state();
+        let gear = state.body("Gear").unwrap();
+        let measure = solidcraft_kernel::measure(&gear.body).unwrap();
+        assert!(measure.volume > 0.0);
+        assert!((measure.bbox.min.z).abs() < 1e-6);
+        assert!((measure.bbox.max.z - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gear_profile_uses_sketch_fillets_and_patterns_the_sector_before_extruding() {
         let mut session = Session::default();
         session
             .execute("gears.insert", &json!({"module": 2, "teeth": 8, "height": 6, "bore": 2, "root_fillet_radius": 0.2, "head_fillet_radius": 0.05}))
             .unwrap();
         assert!(session.doc.features.iter().any(|feature| feature.kind.type_name() == "ExtrudeFeature"));
-        assert!(session.doc.features.iter().any(|feature| feature.kind.type_name() == "CircularPatternFeature"));
+        assert!(
+            session
+                .doc
+                .features
+                .iter()
+                .any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sketch { sketch, .. } if !sketch.patterns.is_empty()))
+        );
         let state = session.world_state();
         assert_eq!(state.bodies.len(), 1);
         let gear = state.body("Gear").unwrap();
@@ -1350,7 +1309,6 @@ mod tests {
                 "head_tolerance": 0.05,
                 "num_points": 16,
                 "simple": true,
-                "undercut": true,
                 "double_helix": true,
                 "helix_angle": 45.0,
                 "axle_hole": false,
@@ -1365,7 +1323,7 @@ mod tests {
         .unwrap();
         let decoded = Gear::decode(&gear.encode(), gear.face_width).unwrap();
         assert_eq!(decoded.num_points, 16);
-        assert!(decoded.simple && decoded.undercut && decoded.double_helix);
+        assert!(decoded.simple && decoded.double_helix);
         assert!(!decoded.axle_hole && decoded.offset_hole && decoded.reversed_backlash);
         assert_eq!(decoded.head_fillet_radius, 0.05);
         assert_eq!(decoded.profile_shift, 0.2);
@@ -1381,13 +1339,12 @@ mod tests {
     }
 
     #[test]
-    fn detailed_tooth_profile_supports_head_fillet_with_undercut_and_root_fillet() {
+    fn detailed_tooth_profile_supports_head_and_root_fillets() {
         let gear = read_gear(
             &json!({
                 "teeth": 24,
                 "root_fillet_radius": 0.2,
                 "head_fillet_radius": 0.05,
-                "undercut": true,
                 "num_points": 24
             }),
             None,
@@ -1396,6 +1353,14 @@ mod tests {
         let outline = gear_outline(&gear).unwrap();
         assert!(outline.len() > 1000);
         assert!(outline.iter().all(|point| point[0].is_finite() && point[1].is_finite()));
+    }
+
+    #[test]
+    fn unimplemented_undercut_is_rejected_and_legacy_value_is_ignored() {
+        assert!(read_gear(&json!({"undercut": true}), None).is_err());
+
+        let legacy = Gear::decode("m=2;z=24;b=8;pa=20;uc=true", 10.0).unwrap();
+        assert!(!legacy.encode().contains("uc="));
     }
 
     #[test]

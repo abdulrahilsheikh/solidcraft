@@ -825,7 +825,16 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         return Err(bad("gears", "the requested head fillet does not fit along the involute"));
     }
 
-    let head_contact = point_at_polyline_distance(&flank, flank_length - head_lead)
+    let head_bridge_length = 0.01;
+    let flank_length = polyline_length(&flank);
+
+    let head_lead = if g.head_fillet_radius > 0.0 { 2.0 * g.head_fillet_radius } else { 0.0 };
+
+    if head_lead + head_bridge_length >= flank_length {
+        return Err(bad("gears", "the requested head fillet does not fit along the involute"));
+    }
+
+    let head_contact = point_at_polyline_distance(&flank, flank_length - head_lead - head_bridge_length)
         .ok_or_else(|| bad("gears", "the involute head contact could not be calculated"))?;
 
     // Fixed straight line: its endpoint does not depend on the root fillet radius.
@@ -870,7 +879,18 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         .and_then(Value::as_str)
         .ok_or_else(|| bad("gears", "the involute spline was not created"))?;
     if g.head_fillet_radius > 0.0 {
-        run(s, "sketch.line", json!({"points": [format!("{flank_id}.end"), tip], "closed": false, "ids": ["gear_head_bridge"]}))?;
+        run(
+            s,
+            "sketch.line",
+            json!({
+                "points": [
+                    format!("{flank_id}.end"),
+                    tip
+                ],
+                "closed": false,
+                "ids": ["gear_head_bridge"]
+            }),
+        )?;
     }
     let tip_angle = if g.head_fillet_radius > 0.0 { head_contact[1].atan2(head_contact[0]) } else { tip[1].atan2(tip[0]) };
     let tip_sweep = -tip_angle;

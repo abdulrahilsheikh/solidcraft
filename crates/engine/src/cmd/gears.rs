@@ -36,6 +36,8 @@ struct Gear {
     simple: bool,
     double_helix: bool,
     axle_hole: bool,
+    internal_gear: bool,
+    rim_thickness: f64,
     offset_hole: bool,
     offset_hole_offset: f64,
     offset_hole_size: f64,
@@ -70,6 +72,8 @@ impl Gear {
             simple: false,
             double_helix: false,
             axle_hole: true,
+            internal_gear: false,
+            rim_thickness: 0.0,
             offset_hole: false,
             offset_hole_offset: 10.0,
             offset_hole_size: 10.0,
@@ -85,11 +89,19 @@ impl Gear {
     }
 
     fn outside_radius(&self) -> f64 {
-        self.pitch_radius() + self.module * (1.0 + self.profile_shift) - self.head_tolerance
+        if self.internal_gear {
+            self.pitch_radius() + self.module * (1.0 + self.profile_shift) + self.head_tolerance
+        } else {
+            self.pitch_radius() + self.module * (1.0 + self.profile_shift) - self.head_tolerance
+        }
     }
 
     fn root_radius(&self) -> f64 {
-        self.pitch_radius() - self.module * (1.0 + self.clearance - self.profile_shift)
+        if self.internal_gear {
+            self.pitch_radius() - self.module * (1.0 - self.clearance + self.profile_shift)
+        } else {
+            self.pitch_radius() - self.module * (1.0 + self.clearance - self.profile_shift)
+        }
     }
 
     fn base_radius(&self) -> f64 {
@@ -216,12 +228,25 @@ impl Gear {
             return Err("helix_angle and gear height produce more than four turns; increase the angle or reduce the height".into());
         }
 
+        if !self.rim_thickness.is_finite() || self.rim_thickness < 0.0 || self.rim_thickness > 1000.0 {
+            return Err("rim_thickness must be between 0 and 1000 mm".into());
+        }
+
+        if self.internal_gear {
+            if self.rim_thickness <= 0.0 {
+                return Err("internal gears require a positive rim thickness".into());
+            }
+
+            if self.axle_hole || self.offset_hole {
+                return Err("internal gears cannot have axle or offset holes".into());
+            }
+        }
         Ok(())
     }
 
     fn encode(&self) -> String {
         format!(
-            "m={};z={};b={};pa={};bl={};fr={};ha={};hf={};np={};sm={};dh={};ah={};oh={};oho={};ohs={};ps={};cl={};ht={};rb={}",
+            "m={};z={};b={};pa={};bl={};fr={};ha={};hf={};np={};sm={};dh={};ah={};oh={};oho={};ohs={};ps={};cl={};ht={};rb={};ig={};rh={}",
             self.module,
             self.teeth,
             self.bore,
@@ -234,6 +259,8 @@ impl Gear {
             self.simple,
             self.double_helix,
             self.axle_hole,
+            self.internal_gear,
+            self.rim_thickness,
             self.offset_hole,
             self.offset_hole_offset,
             self.offset_hole_size,
@@ -264,7 +291,7 @@ impl Gear {
                 "bl" => backlash = value.parse::<f64>().ok(),
                 "fr" => root_fillet_radius = value.parse::<f64>().ok(),
                 "ha" => helix_angle = value.parse::<f64>().ok(),
-                "hf" | "np" | "sm" | "uc" | "dh" | "ah" | "oh" | "oho" | "ohs" | "ps" | "cl" | "ht" | "rb" => {
+                "hf" | "np" | "sm" | "uc" | "dh" | "ah" | "oh" | "oho" | "ohs" | "ps" | "cl" | "ht" | "rb" | "ig" | "rh" => {
                     extra.insert(key, value);
                 }
                 _ => return None,
@@ -293,6 +320,16 @@ impl Gear {
         gear.clearance = extra.get("cl").and_then(|value| value.parse().ok()).unwrap_or(0.25);
         gear.head_tolerance = extra.get("ht").and_then(|value| value.parse().ok()).unwrap_or(0.0);
         gear.reversed_backlash = extra.get("rb").is_some_and(|value| *value == "true");
+
+        gear.internal_gear = extra.get("ig").is_some_and(|value| *value == "true");
+
+        gear.rim_thickness = extra.get("rh").and_then(|value| value.parse::<f64>().ok()).unwrap_or(0.0);
+
+        if gear.internal_gear {
+            // Internal gears do not support axle or offset holes.
+            gear.axle_hole = false;
+            gear.offset_hole = false;
+        }
         Some(gear)
     }
 }
@@ -410,6 +447,17 @@ fn read_gear(p: &Value, previous: Option<&Gear>) -> Result<Gear> {
     gear.clearance = get("clearance", previous.map_or(0.25, |g| g.clearance));
     gear.head_tolerance = get_alias("head_tolerance", "head", previous.map_or(0.0, |g| g.head_tolerance));
     gear.reversed_backlash = flag("reversed_backlash", previous.is_some_and(|g| g.reversed_backlash))?;
+
+    // Internal gear settings: preserve existing values when resizing.
+    gear.internal_gear = flag("internal_gear", previous.is_some_and(|g| g.internal_gear))?;
+
+    gear.rim_thickness = get("rim_thickness", previous.map_or(0.0, |g| g.rim_thickness));
+
+    // Internal gears do not support axle or offset holes.
+    if gear.internal_gear {
+        gear.axle_hole = false;
+        gear.offset_hole = false;
+    }
 
     gear.validate().map_err(|e| bad("gears", e))?;
     Ok(gear)
@@ -851,7 +899,6 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     let head_bridge_length = 0.01;
 
     let head_lead = if g.head_fillet_radius > 0.0 { g.head_fillet_radius + 0.01 } else { 0.0 };
-    // let head_lead = if g.head_fillet_radius > 0.0 { 2.0 * g.head_fillet_radius } else { 0.0 };
 
     if head_lead + head_bridge_length >= flank_length {
         return Err(bad("gears", "the requested head fillet does not fit along the involute"));
@@ -1036,7 +1083,17 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     Ok(())
 }
 
-fn helical_sweep(s: &mut Session, g: &Gear, start: f64, end: f64, start_rotation: f64, twist: f64, suffix: &str, operation: &str) -> Result<()> {
+fn helical_sweep(
+    s: &mut Session,
+    g: &Gear,
+    start: f64,
+    end: f64,
+    start_rotation: f64,
+    twist: f64,
+    suffix: &str,
+    operation: &str,
+    body_name: &str,
+) -> Result<()> {
     let profile_name = format!("Gear profile {suffix}");
     let path_name = format!("Gear path {suffix}");
     let path_id = format!("gear_path_{suffix}");
@@ -1054,20 +1111,55 @@ fn helical_sweep(s: &mut Session, g: &Gear, start: f64, end: f64, start_rotation
             "twist": format!("{twist} rad"),
             "operation": operation,
             "name": format!("Helical gear {suffix}"),
-            "body_name": "Gear",
+            "body_name": body_name,
         }),
     )
     .map_err(|error| bad("gears", format!("helical gear sweep failed: {error}")))?;
     Ok(())
 }
 
+fn unique_gear_body_name(s: &Session, component: u64) -> Result<String> {
+    let state = s.model.state();
+    if state.body("Gear").is_none() {
+        return Ok("Gear".to_string());
+    }
+
+    let base = format!("Gear ({component})");
+    if state.body(&base).is_none() {
+        return Ok(base);
+    }
+
+    let mut suffix = 2_u64;
+    loop {
+        let name = format!("{base} ({suffix})");
+        if state.body(&name).is_none() {
+            return Ok(name);
+        }
+        suffix = suffix.checked_add(1).ok_or_else(|| bad("gears", "could not find a unique gear body name"))?;
+    }
+}
+
 /// Build a gear at its local origin, with the bottom face at z = 0.
-fn build(s: &mut Session, g: &Gear) -> Result<()> {
+fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
     let _frame = crate::frames::local_geometry();
-    // let body_name = format!("Gear {}", g.);
+
     if g.helix_angle == 90.0 {
-        let profile_name = "Gear tooth profile";
-        sector_sketch(s, g, 0.0, 0.0, profile_name)?;
+        let profile_name = format!("Gear tooth profile {}", body_name);
+        sector_sketch(s, g, 0.0, 0.0, &profile_name)?;
+        if g.internal_gear {
+            println!("{}", g.rim_thickness + (g.outside_radius() * 2.0));
+            run(
+                s,
+                "solid.cylinder",
+                json!({
+                    "diameter": format!("{} mm",g.rim_thickness + (g.outside_radius() * 2.00)),
+                    "height": format!("{} mm", g.face_width ),
+                    "base": [0.0, 0.0, 0.0],
+                    "axis": [0, 0, 1],
+                    "operation": "new"
+                }),
+            )?;
+        }
         run(
             s,
             "solid.extrude",
@@ -1075,20 +1167,20 @@ fn build(s: &mut Session, g: &Gear) -> Result<()> {
                 "sketch": profile_name,
                 "distance": format!("{} mm", g.face_width),
                 "direction": "positive",
-                "operation": "new",
+                "operation": if g.internal_gear {"cut"}else{"new"},
                 "name": "Gear",
-                "body_name": "Gear"
+                "body_name": body_name
             }),
         )?;
     } else if g.double_helix {
         let mid = g.face_width / 2.0;
         let half_twist = g.twist() / 2.0;
-        helical_sweep(s, g, 0.0, mid, 0.0, half_twist, "first", "new")?;
+        helical_sweep(s, g, 0.0, mid, 0.0, half_twist, "first", "new", body_name)?;
         run(
             s,
             "solid.mirror",
             json!({
-                "bodies": ["Gear"],
+                "bodies": [body_name],
                 "plane": {"origin": [0, 0, mid], "normal": [0, 0, 1]},
                 "combine": true,
                 "name": "Join double-helix halves"
@@ -1096,28 +1188,29 @@ fn build(s: &mut Session, g: &Gear) -> Result<()> {
         )
         .map_err(|error| bad("gears", format!("mirroring the double-helix half failed: {error}")))?;
     } else {
-        helical_sweep(s, g, 0.0, g.face_width, 0.0, g.twist(), "single", "new")?;
+        helical_sweep(s, g, 0.0, g.face_width, 0.0, g.twist(), "single", "new", body_name)?;
     }
-
-    let mut holes = Vec::new();
-    if g.axle_hole && g.bore > 0.0 {
-        holes.push((0.0, 0.0, g.bore));
-    }
-    if g.offset_hole {
-        holes.push((g.offset_hole_offset, 0.0, g.offset_hole_size));
-    }
-    for (x, y, diameter) in holes {
-        run(
-            s,
-            "solid.cylinder",
-            json!({
-                "diameter": format!("{diameter} mm"),
-                "height": format!("{} mm", g.face_width + 2.0),
-                "base": [x, y, -1],
-                "axis": [0, 0, 1],
-                "operation": "cut"
-            }),
-        )?;
+    if !g.internal_gear {
+        let mut holes = Vec::new();
+        if g.axle_hole && g.bore > 0.0 {
+            holes.push((0.0, 0.0, g.bore));
+        }
+        if g.offset_hole {
+            holes.push((g.offset_hole_offset, 0.0, g.offset_hole_size));
+        }
+        for (x, y, diameter) in holes {
+            run(
+                s,
+                "solid.cylinder",
+                json!({
+                    "diameter": format!("{diameter} mm"),
+                    "height": format!("{} mm", g.face_width + 2.0),
+                    "base": [x, y, -1],
+                    "axis": [0, 0, 1],
+                    "operation": "cut"
+                }),
+            )?;
+        }
     }
 
     Ok(())
@@ -1176,12 +1269,11 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let active = s.active_component;
 
     let created = run(s, "component.create", json!({"name": name}))?;
-    println!("component.create response:\n{}", serde_json::to_string_pretty(&created).unwrap_or_else(|_| created.to_string()));
-    dbg!(&created);
     let component = created["component"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no component id"))?;
     let occurrence = created["occurrence"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no occurrence id"))?;
+    let body_name = unique_gear_body_name(s, component)?;
 
-    build(s, &g)?;
+    build(s, &g, &body_name)?;
 
     // Store the parameters so gears.resize can rebuild this gear.
     s.doc_mut()
@@ -1245,6 +1337,14 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     let old = Gear::decode(&part.size, old_width).ok_or_else(|| bad("gears.resize", "stored gear parameters are invalid"))?;
 
     let g = read_gear(p, Some(&old))?;
+    let body_name = s
+        .model
+        .state()
+        .bodies
+        .iter()
+        .find(|body| s.doc.model_body_component(body) == component)
+        .map(|body| body.name.clone())
+        .map_or_else(|| unique_gear_body_name(s, component), Ok)?;
 
     // Remove this component's feature history in reverse order.
     let ids: Vec<u64> = s.doc.features.iter().filter(|f| f.component == component).map(|f| f.id).collect();
@@ -1257,7 +1357,7 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
 
     run(s, "component.activate", json!({"component": component}))?;
 
-    build(s, &g)?;
+    build(s, &g, &body_name)?;
 
     s.doc_mut()
         .parts
@@ -1318,6 +1418,36 @@ mod tests {
         assert!(read_gear(&json!({"helix_angle": 90.1}), None).is_err());
         assert!(read_gear(&json!({"height": 10.0, "helix_angle": 0.01}), None).is_err());
         assert!(read_gear(&json!({"teeth": MAX_HELICAL_TEETH + 1, "helix_angle": 45.0}), None).is_err());
+    }
+
+    #[test]
+    fn inserted_gears_have_distinct_bodies_and_resize_independently() {
+        let mut session = Session::default();
+        let first = session.execute("gears.insert", &json!({"module":2,"teeth":8,"height":6,"simple":true})).unwrap();
+        let second = session.execute("gears.insert", &json!({"module":3,"teeth":10,"height":9,"simple":true})).unwrap();
+        let first_component = first["component"].as_u64().unwrap();
+        let second_component = second["component"].as_u64().unwrap();
+        let first_body_name = "Gear";
+        let second_body_name = format!("Gear ({second_component})");
+
+        assert_ne!(first_component, second_component);
+        let state = session.world_state();
+        let first_body = state.body(first_body_name).unwrap();
+        let second_body = state.body(&second_body_name).unwrap();
+        assert_eq!(session.doc.model_body_component(first_body), first_component);
+        assert_eq!(session.doc.model_body_component(second_body), second_component);
+        let second_height = solidcraft_kernel::measure(&second_body.body).unwrap().bbox.max.z;
+        assert!((second_height - 9.0).abs() < 1e-6);
+
+        session.execute("gears.resize", &json!({"component":second_component,"height":12})).unwrap();
+
+        let state = session.world_state();
+        let first_body = state.body(first_body_name).unwrap();
+        let second_body = state.body(&second_body_name).unwrap();
+        assert_eq!(session.doc.model_body_component(first_body), first_component);
+        assert_eq!(session.doc.model_body_component(second_body), second_component);
+        assert!((solidcraft_kernel::measure(&first_body.body).unwrap().bbox.max.z - 6.0).abs() < 1e-6);
+        assert!((solidcraft_kernel::measure(&second_body.body).unwrap().bbox.max.z - 12.0).abs() < 1e-6);
     }
 
     #[test]

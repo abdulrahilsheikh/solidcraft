@@ -27,6 +27,8 @@ pub struct Form {
     pub simple: bool,
     pub double_helix: bool,
     pub axle_hole: bool,
+    pub internal_gear: bool,
+    pub rim_thickness: String,
     pub offset_hole: bool,
     pub offset_hole_offset: String,
     pub offset_hole_size: String,
@@ -55,6 +57,8 @@ impl Form {
             simple: false,
             double_helix: false,
             axle_hole: true,
+            internal_gear: false,
+            rim_thickness: "10".into(),
             offset_hole: false,
             offset_hole_offset: "10".into(),
             offset_hole_size: "10".into(),
@@ -97,6 +101,10 @@ impl Form {
             simple: get("sm", "false") == "true",
             double_helix: get("dh", "false") == "true",
             axle_hole: get("ah", "true") == "true",
+
+            internal_gear: get("ig", "false") == "true",
+            rim_thickness: get("rh", "10"),
+
             offset_hole: get("oh", "false") == "true",
             offset_hole_offset: get("oho", "10"),
             offset_hole_size: get("ohs", "10"),
@@ -126,6 +134,8 @@ impl Form {
             self.simple.to_string(),
             self.double_helix.to_string(),
             self.axle_hole.to_string(),
+            self.internal_gear.to_string(),
+            self.rim_thickness.clone(),
             self.offset_hole.to_string(),
             self.offset_hole_offset.clone(),
             self.offset_hole_size.clone(),
@@ -157,11 +167,19 @@ impl Form {
             Ok(parsed)
         };
         let teeth = self.teeth.trim().parse::<u32>().map_err(|_| "Tooth count must be a positive integer")?;
+
+        let internal_gear = self.internal_gear;
+
         Ok(json!({
             "module": parse("Module", &self.module)?,
             "teeth": teeth,
             "height": parse("Gear height", &self.face_width)?,
-            "bore": parse("Bore", &self.bore)?,
+                    // Internal gears do not use axle or offset holes.
+            "bore": if internal_gear {
+                0.0
+            } else {
+                parse("Bore", &self.bore)?
+            },
             "pressure_angle": parse("Pressure angle", &self.pressure_angle)?,
             "backlash": parse("Backlash", &self.backlash)?,
             "root_fillet_radius": parse("Root fillet radius", &self.root_fillet_radius)?,
@@ -170,10 +188,16 @@ impl Form {
             "num_points": parse("Profile accuracy", &self.num_points)?,
             "simple": self.simple,
             "double_helix": self.double_helix,
-            "axle_hole": self.axle_hole,
-            "offset_hole": self.offset_hole,
+
+            "axle_hole": !internal_gear && self.axle_hole,
+            "internal_gear": internal_gear,
+            "rim_thickness": parse("Rim thickness", &self.rim_thickness)?,
+
+
+            "offset_hole": !internal_gear && self.offset_hole,
             "offset_hole_offset": parse("Offset hole distance", &self.offset_hole_offset)?,
             "offset_hole_size": parse("Offset hole diameter", &self.offset_hole_size)?,
+
             "profile_shift": parse("Profile shift", &self.profile_shift)?,
             "clearance": parse("Clearance", &self.clearance)?,
             "head_tolerance": parse("Head tolerance", &self.head_tolerance)?,
@@ -215,10 +239,27 @@ pub fn rows(_app: &mut SolveApp, ui: &mut egui::Ui, form: &mut Form) -> bool {
     row(ui, "Module (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.module, "e.g. 2").0);
     row(ui, "Tooth count", |ui| crate::ui_kit::text_field(ui, &mut form.teeth, "e.g. 24").0);
     row(ui, "Gear height (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.face_width, "e.g. 10").0);
-    row(ui, "Axle hole", |ui| ui.checkbox(&mut form.axle_hole, "").changed());
-    if form.axle_hole {
-        row(ui, "Axle hole diameter (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.bore, "0 for none").0);
+
+    row(ui, "Internal Gear", |ui| ui.checkbox(&mut form.internal_gear, "").changed());
+
+    if form.internal_gear {
+        row(ui, "Rim thickness (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.rim_thickness, "e.g. 5").0);
+    } else {
+        row(ui, "Axle hole", |ui| ui.checkbox(&mut form.axle_hole, "").changed());
+
+        if form.axle_hole {
+            row(ui, "Axle hole diameter (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.bore, "0 for none").0);
+        }
+
+        row(ui, "Offset hole", |ui| ui.checkbox(&mut form.offset_hole, "").changed());
+
+        if form.offset_hole {
+            row(ui, "Offset hole distance (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.offset_hole_offset, "from gear center").0);
+
+            row(ui, "Offset hole diameter (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.offset_hole_size, "hole diameter").0);
+        }
     }
+
     row(ui, "Pressure angle (deg)", |ui| crate::ui_kit::text_field(ui, &mut form.pressure_angle, "e.g. 20").0);
     row(ui, "Backlash (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.backlash, "positive or negative").0);
     row(ui, "Reverse backlash", |ui| ui.checkbox(&mut form.reversed_backlash, "").changed());
@@ -231,11 +272,7 @@ pub fn rows(_app: &mut SolveApp, ui: &mut egui::Ui, form: &mut Form) -> bool {
     row(ui, "Simple profile", |ui| ui.checkbox(&mut form.simple, "").changed());
     row(ui, "Helix angle (deg)", |ui| crate::ui_kit::text_field(ui, &mut form.helix_angle, "90 straight, <90 helical; max 24 teeth").0);
     row(ui, "Double helix", |ui| ui.checkbox(&mut form.double_helix, "").changed());
-    row(ui, "Offset hole", |ui| ui.checkbox(&mut form.offset_hole, "").changed());
-    if form.offset_hole {
-        row(ui, "Offset hole distance (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.offset_hole_offset, "from gear center").0);
-        row(ui, "Offset hole diameter (mm)", |ui| crate::ui_kit::text_field(ui, &mut form.offset_hole_size, "hole diameter").0);
-    }
+
     let numeric = |value: &str| value.trim().parse::<f64>().ok().filter(|value| value.is_finite());
     if let (Some(module), Some(teeth), Some(pressure_angle), Some(helix_angle), Some(shift), Some(clearance), Some(head), Some(backlash)) = (
         numeric(&form.module),

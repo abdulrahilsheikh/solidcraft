@@ -774,6 +774,7 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     use std::f64::consts::PI;
 
     let (sin, cos) = start_rotation.sin_cos();
+
     run(
         s,
         "sketch.create",
@@ -792,52 +793,73 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     let rf = g.root_radius();
     let alpha = g.pressure_angle.to_radians();
     let inv_alpha = alpha.tan() - alpha;
+
     let tooth_half_thickness = PI / (2.0 * g.teeth as f64);
+
     let flank_rotation =
         tooth_half_thickness + inv_alpha + (g.effective_backlash() / 2.0 + g.profile_shift * g.module * alpha.tan()) / g.pitch_radius();
+
     let end_t = involute_t(rb, ra);
+
     let flank: Vec<[f64; 2]> = (0..=g.involute_segments())
         .map(|i| {
             let point = involute_point(rb, end_t * i as f64 / g.involute_segments() as f64);
             rotate_point(point, -flank_rotation)
         })
         .collect();
-    let Some(base) = flank.first().copied() else { return Err(bad("gears", "the involute flank is empty")) };
-    let Some(tip) = flank.last().copied() else { return Err(bad("gears", "the involute tip is missing")) };
+
+    let Some(base) = flank.first().copied() else {
+        return Err(bad("gears", "the involute flank is empty"));
+    };
+
+    let Some(tip) = flank.last().copied() else {
+        return Err(bad("gears", "the involute tip is missing"));
+    };
+
     let root_angle = base[1].atan2(base[0]);
     let sector_angle = -PI / g.teeth as f64;
     let root_start_sweep = positive_angle_delta(sector_angle, root_angle);
+
     if !(root_start_sweep > 1e-9 && root_start_sweep < PI) {
         return Err(bad("gears", "the tooth does not fit inside its circular pattern sector"));
     }
+
     let sector_start = [rf * sector_angle.cos(), rf * sector_angle.sin()];
-    run(s, "sketch.line", json!({"points": [[0, 0], sector_start], "closed": false, "ids": ["gear_sector_boundary"]}))?;
+
+    run(
+        s,
+        "sketch.line",
+        json!({
+            "points": [[0, 0], sector_start],
+            "closed": false,
+            "ids": ["gear_sector_boundary"]
+        }),
+    )?;
+
     run(
         s,
         "sketch.arc.center_point",
-        json!({"center": [0, 0], "start": "gear_sector_boundary.end", "sweep": root_start_sweep.to_degrees(), "id": "gear_root_arc"}),
+        json!({
+            "center": [0, 0],
+            "start": "gear_sector_boundary.end",
+            "sweep": root_start_sweep.to_degrees(),
+            "id": "gear_root_arc"
+        }),
     )?;
 
     let flank_length = polyline_length(&flank);
-    let head_lead = if g.head_fillet_radius > 0.0 { 2.0 * g.head_fillet_radius } else { 0.0 };
-
-    if head_lead >= flank_length {
-        return Err(bad("gears", "the requested head fillet does not fit along the involute"));
-    }
-
     let head_bridge_length = 0.01;
-    let flank_length = polyline_length(&flank);
 
-    let head_lead = if g.head_fillet_radius > 0.0 { 2.0 * g.head_fillet_radius } else { 0.0 };
+    let head_lead = if g.head_fillet_radius > 0.0 { g.head_fillet_radius + 0.01 } else { 0.0 };
+    // let head_lead = if g.head_fillet_radius > 0.0 { 2.0 * g.head_fillet_radius } else { 0.0 };
 
     if head_lead + head_bridge_length >= flank_length {
         return Err(bad("gears", "the requested head fillet does not fit along the involute"));
     }
 
-    let head_contact = point_at_polyline_distance(&flank, flank_length - head_lead - head_bridge_length)
-        .ok_or_else(|| bad("gears", "the involute head contact could not be calculated"))?;
+    let spline_end_distance = if g.head_fillet_radius > 0.0 { flank_length - head_lead - head_bridge_length } else { flank_length };
 
-    // Fixed straight line: its endpoint does not depend on the root fillet radius.
+    // Keep the root bridge fixed regardless of the root fillet radius.
     run(
         s,
         "sketch.line",
@@ -848,65 +870,80 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         }),
     )?;
 
-    // The spline always starts at the base point.
-    let mut fit_values = Vec::with_capacity(flank.len() + 1);
+    // Choose the spline endpoint so the remaining involute segment
+    // has approximately the requested head bridge length.
+    let head_contact =
+        point_at_polyline_distance(&flank, spline_end_distance).ok_or_else(|| bad("gears", "the involute head contact could not be calculated"))?;
+
+    let mut fit_values = Vec::with_capacity(flank.len());
+
     fit_values.push(json!(base));
 
     let mut distance = 0.0;
+
     for (index, pair) in flank.windows(2).enumerate() {
         distance += (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
 
-        if distance > 0.0 && distance < flank_length - head_lead {
+        if distance > 0.0 && distance < flank_length - head_lead - head_bridge_length {
             if let Some(point) = flank.get(index + 1) {
                 fit_values.push(json!(point));
             }
         }
     }
 
-    if g.head_fillet_radius > 0.0 {
-        fit_values.push(json!(head_contact));
-    } else {
-        fit_values.push(json!(tip));
-    }
+    fit_values.push(json!(head_contact));
 
     if fit_values.len() < 2 {
         return Err(bad("gears", "the involute needs at least two fit points"));
     }
+
     let flank_result = run(s, "sketch.spline.fit_point", json!({"points": fit_values}))?;
+
     let flank_id = flank_result["curves"]
         .as_array()
         .and_then(|curves| curves.first())
         .and_then(Value::as_str)
         .ok_or_else(|| bad("gears", "the involute spline was not created"))?;
+
+    // Create exactly one head bridge.
     if g.head_fillet_radius > 0.0 {
         run(
             s,
             "sketch.line",
             json!({
-                "points": [
-                    format!("{flank_id}.end"),
-                    tip
-                ],
+                "points": [format!("{flank_id}.end"), tip],
                 "closed": false,
                 "ids": ["gear_head_bridge"]
             }),
         )?;
     }
-    let tip_angle = if g.head_fillet_radius > 0.0 { head_contact[1].atan2(head_contact[0]) } else { tip[1].atan2(tip[0]) };
-    let tip_sweep = -tip_angle;
-    if !(tip_sweep > 1e-9 && tip_sweep < 180.0_f64.to_radians()) {
+
+    // let tip_angle = tip[1].atan2(tip[0]);
+
+    let head_arc_start = if g.head_fillet_radius > 0.0 { tip[1].atan2(tip[0]) } else { tip[1].atan2(tip[0]) };
+
+    let tip_sweep = -head_arc_start;
+    // let tip_sweep = -tip_angle;
+
+    if !(tip_sweep > 1e-9 && tip_sweep < PI) {
         return Err(bad("gears", "the involute tip is outside its tooth sector"));
     }
+
     run(
         s,
         "sketch.arc.center_point",
         json!({
             "center": [0, 0],
-            "start": if g.head_fillet_radius > 0.0 { "gear_head_bridge.end".to_string() } else { format!("{flank_id}.end") },
+            "start": if g.head_fillet_radius > 0.0 {
+                "gear_head_bridge.end".to_string()
+            } else {
+                format!("{flank_id}.end")
+            },
             "sweep": tip_sweep.to_degrees(),
             "id": "gear_tip_arc"
         }),
     )?;
+
     if g.root_fillet_radius > 0.0 {
         run(
             s,
@@ -917,32 +954,85 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
             }),
         )?;
     }
+
     if g.head_fillet_radius > 0.0 {
-        run(s, "sketch.fillet", json!({"point": "gear_head_bridge.end", "radius": g.head_fillet_radius}))?;
+        run(
+            s,
+            "sketch.fillet",
+            json!({
+                "point": "gear_head_bridge.end",
+                "radius": g.head_fillet_radius
+            }),
+        )?;
     }
+
     run(
         s,
         "sketch.line",
-        json!({"points": ["gear_sector_boundary.start", [ra * 1.1, 0]], "closed": false, "construction": true, "ids": ["gear_mirror_axis"]}),
+        json!({
+            "points": ["gear_sector_boundary.start", [ra * 1.1, 0]],
+            "closed": false,
+            "construction": true,
+            "ids": ["gear_mirror_axis"]
+        }),
     )?;
-    run(s, "sketch.construction", json!({"curves": ["gear_sector_boundary"], "value": true}))?;
+
+    run(
+        s,
+        "sketch.construction",
+        json!({
+            "curves": ["gear_sector_boundary"],
+            "value": true
+        }),
+    )?;
+
     let active = s.active_sketch.ok_or_else(|| bad("gears", "the gear sketch is not active"))?;
+
     let state = s.model.state();
+
     let sketch = state.sketch(active).ok_or_else(|| bad("gears", "the gear sketch is missing"))?;
+
     let entities: Vec<String> = sketch.sketch.curves.iter().filter(|curve| !curve.construction).map(|curve| curve.id.clone()).collect();
+
     if entities.is_empty() {
         return Err(bad("gears", "the gear sector profile is empty"));
     }
-    run(s, "sketch.mirror", json!({"entities": entities, "line": "gear_mirror_axis"}))?;
+
+    run(
+        s,
+        "sketch.mirror",
+        json!({
+            "entities": entities,
+            "line": "gear_mirror_axis"
+        }),
+    )?;
+
     let active = s.active_sketch.ok_or_else(|| bad("gears", "the gear sketch is not active"))?;
+
     let state = s.model.state();
+
     let sketch = state.sketch(active).ok_or_else(|| bad("gears", "the gear sketch is missing"))?;
+
     let pattern_entities: Vec<String> = sketch.sketch.curves.iter().filter(|curve| !curve.construction).map(|curve| curve.id.clone()).collect();
+
     if !pattern_entities.is_empty() {
         run(s, "sketch.constraint.fix", json!({"entities": pattern_entities}))?;
     }
-    run(s, "sketch.pattern.circular", json!({"entities": pattern_entities, "center": [0, 0], "count": g.teeth, "angle": 360, "associative": false}))?;
+
+    run(
+        s,
+        "sketch.pattern.circular",
+        json!({
+            "entities": pattern_entities,
+            "center": [0, 0],
+            "count": g.teeth,
+            "angle": 360,
+            "associative": false
+        }),
+    )?;
+
     run(s, "sketch.finish", json!({}))?;
+
     Ok(())
 }
 
@@ -974,6 +1064,7 @@ fn helical_sweep(s: &mut Session, g: &Gear, start: f64, end: f64, start_rotation
 /// Build a gear at its local origin, with the bottom face at z = 0.
 fn build(s: &mut Session, g: &Gear) -> Result<()> {
     let _frame = crate::frames::local_geometry();
+    // let body_name = format!("Gear {}", g.);
     if g.helix_angle == 90.0 {
         let profile_name = "Gear tooth profile";
         sector_sketch(s, g, 0.0, 0.0, profile_name)?;
@@ -1085,7 +1176,8 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let active = s.active_component;
 
     let created = run(s, "component.create", json!({"name": name}))?;
-
+    println!("component.create response:\n{}", serde_json::to_string_pretty(&created).unwrap_or_else(|_| created.to_string()));
+    dbg!(&created);
     let component = created["component"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no component id"))?;
     let occurrence = created["occurrence"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no occurrence id"))?;
 

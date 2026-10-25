@@ -1,6 +1,7 @@
 //! Several open designs, as tabs in the application bar. The active design lives in the app as
 //! always (`app.session`, `app.cam`…); the others wait here with their own session (undo,
-//! selection), camera and per-design view state, and are swapped in when their tab is picked.
+//! selection), camera, agent conversation and per-design view state, and are swapped in when
+//! their tab is picked.
 //! Closing a design with unsaved changes asks first, and so does quitting: one "save changes?"
 //! per design with unsaved changes ([`request_quit`]).
 
@@ -26,15 +27,14 @@ pub struct DocSlot {
     pre_sketch_marker: Option<Option<usize>>,
     view: DocView,
     occurrence_move: Option<crate::browser::OccMove>,
+    agent_chat: crate::agent_chat::AgentChat,
 }
 
-/// The per-design part of the UI state (what is hidden, shown or locked).
+/// The per-design part of the UI state the session doesn't keep (what is hidden, shown or locked
+/// is in the session's `visibility`, saved with the design).
 #[derive(Clone, Debug, Default)]
 struct DocView {
     render: crate::render_workspace::ViewState,
-    hidden_profiles: Vec<u64>,
-    shown_dims: Vec<u64>,
-    locked_bodies: Vec<String>,
 }
 
 impl DocSlot {
@@ -47,6 +47,7 @@ impl DocSlot {
             pre_sketch_marker: None,
             view: DocView::default(),
             occurrence_move: None,
+            agent_chat: Default::default(),
         }
     }
 }
@@ -75,6 +76,11 @@ impl Documents {
         self.slots.iter_mut().filter_map(Option::as_mut)
     }
 
+    /// The designs in the tabs not shown.
+    pub(crate) fn background(&self) -> impl Iterator<Item = &Session> {
+        self.slots.iter().filter_map(Option::as_ref).map(|slot| &slot.session)
+    }
+
     /// Number of open designs (at least the active one).
     pub fn count(&self) -> usize {
         self.slots.len().max(1)
@@ -82,27 +88,18 @@ impl Documents {
 }
 
 fn take_view(app: &mut SolveApp) -> DocView {
-    let u = &mut app.ui;
-    DocView {
-        render: std::mem::take(&mut app.render_workspace.view),
-        hidden_profiles: std::mem::take(&mut u.hidden_profiles),
-        shown_dims: std::mem::take(&mut u.shown_dims),
-        locked_bodies: std::mem::take(&mut u.locked_bodies),
-    }
+    DocView { render: std::mem::take(&mut app.render_workspace.view) }
 }
 
 fn put_view(app: &mut SolveApp, v: DocView) {
     app.render_workspace.view = v.render;
+    crate::render_workspace::invalidate_images(app);
     crate::render_workspace::invalidate_scene(app);
     crate::render_workspace::sync_backend(app);
-    let u = &mut app.ui;
-    u.hidden_profiles = v.hidden_profiles;
-    u.shown_dims = v.shown_dims;
-    u.locked_bodies = v.locked_bodies;
 }
 
 /// Put `slot` into the app and return what was there.
-fn swap_in(app: &mut SolveApp, slot: DocSlot) -> DocSlot {
+fn swap_in(app: &mut SolveApp, mut slot: DocSlot) -> DocSlot {
     if crate::render_workspace::active(app) {
         let _ = crate::render_workspace::enter(app, false);
     }
@@ -120,6 +117,8 @@ fn swap_in(app: &mut SolveApp, slot: DocSlot) -> DocSlot {
     app.viewport.hover = None;
     app.menu.props = None;
     crate::sketch_attachment_ui::clear(app);
+    crate::agent_chat::leave_document(app);
+    app.agent_chat.swap_document(&mut slot.agent_chat);
     let out_rev = app.session.revision;
     let mut out = DocSlot {
         session: std::mem::replace(&mut app.session, slot.session),
@@ -129,6 +128,7 @@ fn swap_in(app: &mut SolveApp, slot: DocSlot) -> DocSlot {
         pre_sketch_marker: std::mem::replace(&mut app.pre_sketch_marker, slot.pre_sketch_marker),
         view: take_view(app),
         occurrence_move: std::mem::replace(&mut app.tree.occurrence_move, slot.occurrence_move),
+        agent_chat: slot.agent_chat,
     };
     // Only the displayed design owns the process-wide crash replay journal.
     app.session.crash_journal = out.session.crash_journal;
@@ -215,6 +215,7 @@ pub fn active_is_blank(app: &SolveApp) -> bool {
 pub fn adopt(app: &mut SolveApp, session: Session) {
     if active_is_blank(app) {
         let rev = app.session.revision;
+        reset_chat(app);
         crate::dialogs::cancel(app);
         app.tool = None;
         app.menu.props = None;
@@ -297,6 +298,7 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
     app.docs.closing = None;
     if n <= 1 {
         // The last design: a blank one takes its place.
+        reset_chat(app);
         if let Some(a) = app.autosave.as_mut().and_then(|a| a.active.take()) {
             a.discard();
         }
@@ -327,6 +329,19 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
     }
     if app.docs.active > i {
         app.docs.active -= 1;
+    }
+}
+
+/// A replacement design starts a fresh conversation while retaining the window's chat services.
+pub(crate) fn reset_chat(app: &mut SolveApp) {
+    crate::agent_chat::leave_document(app);
+    app.agent_chat.swap_document(&mut crate::agent_chat::AgentChat::default());
+}
+
+/// Hidden conversations must also stop when AI is disabled or the application quits.
+pub(crate) fn disconnect_background_chats(app: &mut SolveApp, wait: bool) {
+    for slot in app.docs.background_mut() {
+        slot.agent_chat.disconnect_document(&mut slot.session, wait);
     }
 }
 
@@ -424,9 +439,26 @@ pub fn tabs_info(app: &SolveApp) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// Where each tab's design is saved, in `tabs_info`'s order (`None`: not saved yet).
+fn tab_paths(app: &SolveApp) -> Vec<Option<String>> {
+    if app.docs.slots.is_empty() {
+        return vec![app.session.path.clone()];
+    }
+    app.docs.slots.iter().map(|s| s.as_ref().map_or(&app.session, |d| &d.session).path.clone()).collect()
+}
+
+/// A tab's tooltip: where its design is saved (home shortened to `~`), or that it isn't yet; with
+/// the full name above when the tab cut it short (#5868).
+fn tab_tooltip(name: &str, path: Option<&str>, cut: bool) -> String {
+    let place = path.map_or_else(|| crate::i18n::tr_label("Not saved yet").to_string(), crate::home::friendly_path);
+    if cut { format!("{name}\n{place}") } else { place }
+}
+
 /// The control channel's `ui.documents`: list, `new`, `switch`, `close` (by index; `force`
 /// closes without asking), `close_others` (all but `index`), `close_all`, `move` (`from`, `to`)
-/// or `quit`; `answer`: save | dont_save | cancel answers "save changes?".
+/// or `quit`; `answer`: save | dont_save | cancel answers "save changes?"; `open_elsewhere`:
+/// read_only | anyway | cancel and `changed_on_disk`: save_copy | overwrite | cancel answer those
+/// questions (#5467).
 pub fn control(app: &mut SolveApp, p: &Value) -> Value {
     let i = p.get("index").and_then(Value::as_u64).map(|x| x as usize);
     match p.get("action").and_then(Value::as_str) {
@@ -456,8 +488,30 @@ pub fn control(app: &mut SolveApp, p: &Value) -> Value {
     if let Some(a) = answer {
         answer_prompt(app, a);
     }
+    use crate::open_elsewhere::{DiskAnswer, LockAnswer, answer_disk, answer_lock};
+    match p.get("open_elsewhere").and_then(Value::as_str) {
+        Some("read_only") => answer_lock(app, LockAnswer::ReadOnly),
+        Some("anyway") => answer_lock(app, LockAnswer::Anyway),
+        Some("cancel") => answer_lock(app, LockAnswer::Cancel),
+        _ => {}
+    }
+    match p.get("changed_on_disk").and_then(Value::as_str) {
+        Some("save_copy") => answer_disk(app, DiskAnswer::SaveCopy),
+        Some("overwrite") => answer_disk(app, DiskAnswer::Overwrite),
+        Some("cancel") => answer_disk(app, DiskAnswer::Cancel),
+        _ => {}
+    }
     let tabs: Vec<Value> = tabs_info(app).into_iter().map(|(name, dirty)| json!({"name": name, "dirty": dirty})).collect();
-    json!({"documents": tabs, "active": app.docs.active, "closing": app.docs.closing, "quitting": app.docs.quitting.is_some(), "batch": app.docs.batch})
+    json!({
+        "documents": tabs,
+        "active": app.docs.active,
+        "closing": app.docs.closing,
+        "quitting": app.docs.quitting.is_some(),
+        "batch": app.docs.batch,
+        "read_only": app.session.read_only,
+        "open_elsewhere": app.lock_prompts.len(),
+        "changed_on_disk": app.disk_prompt,
+    })
 }
 
 /// A design tab being dragged along the strip to a new place: its index, and where the pointer
@@ -473,6 +527,7 @@ struct TabDrag {
 pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
     let t = Tokens::get();
     let info = tabs_info(app);
+    let paths = tab_paths(app);
     let n = info.len();
     let (first, shown, w) = layout(n, app.docs.active, x1 - x0);
     let mut pick: Option<usize> = None;
@@ -569,6 +624,7 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
         };
         let g = ui.painter().layout_no_wrap(label, font, ink);
         let text_w = (tr.width() - 30.0).max(10.0);
+        let tip = tab_tooltip(&name_display, paths.get(i).cloned().flatten().as_deref(), g.size().x > text_w);
         let clip = Rect::from_min_size(tr.min, vec2(text_w + 10.0, tr.height()));
         ui.painter().with_clip_rect(clip).galley(pos2(tr.left() + 10.0, tr.center().y - g.size().y / 2.0), g, ink);
         // ×
@@ -592,7 +648,7 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
         }
         if xresp.on_hover_text("Close").clicked() {
             shut = Some(i);
-        } else if (if held.is_some() { resp } else { resp.on_hover_text(name.as_str()) }).clicked() {
+        } else if (if held.is_some() { resp } else { resp.on_hover_text(tip) }).clicked() {
             pick = Some(i);
         }
     }
@@ -886,6 +942,20 @@ mod tests {
     use super::*;
     use crate::Services;
     use egui::Color32;
+
+    /// #5868: a tab's tooltip says where its design is saved (home as `~`), or that it isn't
+    /// yet, with the full name above when the tab cut the name short.
+    #[test]
+    fn tab_tooltip_says_where_the_design_is_saved() {
+        assert_eq!(tab_tooltip("plate", Some("/srv/designs/plate.solidcraft"), false), "/srv/designs/plate.solidcraft");
+        assert_eq!(tab_tooltip("a-long-name", Some("/srv/a-long-name.solidcraft"), true), "a-long-name\n/srv/a-long-name.solidcraft");
+        assert_eq!(tab_tooltip("Untitled", None, false), "Not saved yet");
+        assert_eq!(tab_tooltip("Untitled", None, true), "Untitled\nNot saved yet");
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            let path = std::path::Path::new(&home).join("Designs").join("bracket.solidcraft");
+            assert_eq!(tab_tooltip("bracket", path.to_str(), false), "~/Designs/bracket.solidcraft");
+        }
+    }
 
     fn app() -> SolveApp {
         SolveApp::new(Session::default(), Services::default())
@@ -1230,6 +1300,34 @@ mod tests {
         adopt(&mut a, Session::default());
         assert_eq!(a.docs.count(), 1);
         assert!(!a.session.auto_project, "a design adopted over a blank one");
+    }
+
+    /// Hide Origin by Default hides the Origin of designs that don't keep its eye; a design that
+    /// does keeps it, along with the rest of the browser's view, in its tab and in its file.
+    #[test]
+    fn the_browsers_view_follows_each_design_and_the_origin_preference() {
+        let mut a = app();
+        assert!(a.origin_shown());
+        a.preferences.hide_origin = true;
+        assert!(!a.origin_shown() && !a.session.is_dirty(), "the preference is not a change to the design");
+        let mut b = app();
+        b.load_prefs(&a.prefs());
+        assert!(b.preferences.hide_origin && !b.origin_shown(), "the preference is kept between runs");
+        // This design shows its Origin and locks its body and hides its Sketches folder.
+        a.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        a.set_origin_shown(true);
+        a.session.visibility.locked_bodies.push("Body1".into());
+        a.session.visibility.hidden_folders.push("c0/sketches".into());
+        new_design(&mut a);
+        assert!(!a.origin_shown() && a.session.visibility.is_empty(), "a new design follows the preference");
+        switch(&mut a, 0);
+        assert!(a.origin_shown() && a.session.visibility.locked_bodies == ["Body1"] && a.session.folder_hidden("c0/sketches"));
+        // Opened again, the design's own Origin setting wins over the preference.
+        let text = a.session.design().to_json();
+        let mut c = app();
+        c.preferences.hide_origin = true;
+        c.session = Session::new(solidcraft_engine::doc::Document::from_json(&text).unwrap());
+        assert!(c.origin_shown() && c.session.visibility == a.session.visibility);
     }
 
     /// #1205: Units of new designs apply to the empty design a launch shows, to New while that

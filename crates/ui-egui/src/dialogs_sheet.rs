@@ -37,6 +37,10 @@ const RULE_FIELDS: [(&str, &str); 8] = [
 /// The corner relief shapes the manager offers (the rule's `corner_relief_shape`) and their labels.
 const RELIEF_SHAPES: [&str; 4] = ["notch", "round", "rectangular", "tear"];
 const RELIEF_SHAPE_LABELS: [&str; 4] = ["Notch", "Round", "Rectangular", "Tear"];
+/// How the manager's rule reads bend angles in the DXF bend notes (the rule's `angle_display`)
+/// and their labels.
+const ANGLE_DISPLAYS: [&str; 2] = ["bend", "included"];
+const ANGLE_DISPLAY_LABELS: [&str; 2] = ["Bend", "Included"];
 /// The corner relief shapes an edge flange offers: the rule's (index 0, nothing of its own), then
 /// the shapes of `RELIEF_SHAPES` in order.
 const FLANGE_RELIEF_LABELS: [&str; 5] = ["Rule", "Notch", "Round", "Rectangular", "Tear"];
@@ -90,6 +94,8 @@ crate::dialog_descriptor::dialog_descriptors! {
                 values: Vec<String>,
                 /// The corner relief shape (index into `RELIEF_SHAPES`).
                 relief: usize,
+                /// How bend angles read (index into `ANGLE_DISPLAYS`).
+                angles: usize,
                 active: bool,
                 loaded: Option<usize>,
             },
@@ -165,7 +171,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
             let active = app.session.doc.sheet.active.clone();
             let rules = rule_list(app);
             let pick = active.and_then(|a| rules.iter().position(|r| r.name == a)).unwrap_or(0);
-            (Sm::Rules { pick, name: String::new(), values: Vec::new(), relief: 0, active: true, loaded: None }, vec![])
+            (Sm::Rules { pick, name: String::new(), values: Vec::new(), relief: 0, angles: 0, active: true, loaded: None }, vec![])
         }
         "sheet.flat_pattern" => (Sm::FlatPattern { data: None, key: None, status: None }, vec![SelInput::new("Body (last if none)", BODIES, false)]),
         _ => Sm::simple_start(id)?,
@@ -286,7 +292,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
         }
         Sm::Unfold { .. } => {}
         Sm::Convert { rule } => rule_combo(app, ui, "sm_conv_rule", rule),
-        Sm::Rules { pick, name, values, relief, active, loaded } => {
+        Sm::Rules { pick, name, values, relief, angles, active, loaded } => {
             let rules = rule_list(app);
             crate::rule_editor::rule_editor! {
                 ui, "sm_rules", rules, pick, name, active, loaded;
@@ -305,6 +311,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
                         base.gap.clone(),
                     ];
                     *relief = RELIEF_SHAPES.iter().position(|s| s.eq_ignore_ascii_case(base.corner_relief_shape.trim())).unwrap_or(0);
+                    *angles = ANGLE_DISPLAYS.iter().position(|d| d.eq_ignore_ascii_case(base.angle_display.trim())).unwrap_or(0);
                     *active = app.session.doc.sheet_rule(None).name == base.name || *pick >= rules.len();
                 },
                 fields: {
@@ -315,6 +322,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
                         }
                         enter |= expr_row(ui, label, v);
                     }
+                    choice_row(ui, "Angle Display", "sm_angle_display", angles, &ANGLE_DISPLAY_LABELS);
                 }
             }
             if *pick < rules.len()
@@ -569,11 +577,12 @@ pub fn commands(app: &SolveApp, k: &Sm, inputs: &[SelInput], extra: &Map<String,
             }
             ("sheet.convert", p)
         }
-        Sm::Rules { pick, name, values, relief, active, .. } => {
+        Sm::Rules { pick, name, values, relief, angles, active, .. } => {
             let rules = rule_list(app);
             let fields = RULE_FIELDS.iter().map(|(key, _)| *key).zip(values);
             let mut p = crate::rule_editor::params(rules.get(*pick).map(|r| r.name.as_str()), name, *active, fields)?;
             p["corner_relief_shape"] = json!(RELIEF_SHAPES.get(*relief).copied().unwrap_or("notch"));
+            p["angle_display"] = json!(ANGLE_DISPLAYS.get(*angles).copied().unwrap_or("bend"));
             ("sheet.manage_rules", p)
         }
         Sm::FlatPattern { .. } => return Ok(Vec::new()),
@@ -715,15 +724,24 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind) -> Option<(Kind, Vec<SelI
 
 // ---- view ----
 
-/// The direction an edge flange or hem grows from its first edge: out of the sheet's larger
-/// neighbouring face for a flange, toward it for a hem (flipped with Flip).
+/// The direction an edge flange grows from its first edge: out of the sheet's larger
+/// neighbouring face (flipped with Flip). A hem's handle runs along the hem instead
+/// ([`hem_handle`]).
 pub fn arrow(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
     let Kind::Sheet(k) = &d.kind else { return None };
     let flip = match k {
         Sm::Flange { ty: 1, flip, .. } => *flip,
-        Sm::Hem { flip, .. } => !flip,
+        Sm::Hem { .. } => return hem_handle(app, d).map(|(_, dir)| dir),
         _ => return None,
     };
+    let (n, _, _) = edge_frame(app, d)?;
+    Some(if flip { -n } else { n })
+}
+
+/// The sheet at the dialog's first picked edge: the unit normal of the larger neighbouring face
+/// (out of the sheet), the unit normal of the other neighbour (the edge's end face, pointing away
+/// from the sheet), and the sheet's thickness along the first.
+fn edge_frame(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Vec3, f64)> {
     let Sel::Edge { body, index, point } = d.inputs.first()?.items.first()? else { return None };
     let st = app.session.world_state();
     let m = st.body(body)?.mesh();
@@ -737,16 +755,40 @@ pub fn arrow(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
             .map(|[a, b, c]| (b - a).cross(c - a).len() * 0.5)
             .sum()
     };
+    let normal = |f: u32| -> Option<Vec3> {
+        m.triangles
+            .iter()
+            .zip(&m.tri_face)
+            .filter(|(_, tf)| **tf == f)
+            .filter_map(|(t, _)| m.tri(t))
+            .min_by(|a, b| ((a[0] + a[1] + a[2]) / 3.0).dist(*point).total_cmp(&((b[0] + b[1] + b[2]) / 3.0).dist(*point)))
+            .and_then(|[a, b, c]| (b - a).cross(c - a).normalized())
+    };
     let f = faces.iter().copied().max_by(|a, b| area(*a).total_cmp(&area(*b)))?;
-    let n = m
-        .triangles
-        .iter()
-        .zip(&m.tri_face)
-        .filter(|(_, tf)| **tf == f)
-        .filter_map(|(t, _)| m.tri(t))
-        .min_by(|a, b| ((a[0] + a[1] + a[2]) / 3.0).dist(*point).total_cmp(&((b[0] + b[1] + b[2]) / 3.0).dist(*point)))
-        .and_then(|[a, b, c]| (b - a).cross(c - a).normalized())?;
-    Some(if flip { -n } else { n })
+    let g = faces.iter().copied().find(|g| *g != f)?;
+    let (n, end) = (normal(f)?, normal(g)?);
+    // The end face spans the sheet's thickness along the normal.
+    let heights = m.triangles.iter().zip(&m.tri_face).filter(|(_, tf)| **tf == g).filter_map(|(t, _)| m.tri(t)).flatten().map(|v| v.dot(n));
+    let (lo, hi) = heights.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), h| (lo.min(h), hi.max(h)));
+    let thickness = hi - lo;
+    (thickness.is_finite() && thickness > 0.0).then_some((n, end, thickness))
+}
+
+/// Where a hem's handle starts and where it points (#5828). Its Length is measured from the outer
+/// face of the fold to the hem's tip, so the handle starts on the centre line of the hem layer at
+/// that face and runs along the hem toward the tip: square to the picked edge, back over the sheet.
+/// The layer lies on the far side of the sheet from the larger face unless flipped. The Gap is
+/// taken from the dialog when it holds a number; otherwise the layer sits flat against the sheet.
+pub fn hem_handle(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Vec3)> {
+    let Kind::Sheet(Sm::Hem { gap, flip, .. }) = &d.kind else { return None };
+    let Sel::Edge { point, .. } = d.inputs.first()?.items.first()? else { return None };
+    let (n, end, thickness) = edge_frame(app, d)?;
+    let gap = app.session.doc.eval(gap, ValueKind::Length).ok().filter(|g| g.is_finite() && *g >= 0.0).unwrap_or(0.0);
+    // The hem's side of the sheet, as a unit vector along the larger face's normal, and the
+    // distance of the layer's centre line from the face the edge lies on.
+    let (side, depth) = if *flip { (n, gap + thickness / 2.0) } else { (-n, thickness + gap + thickness / 2.0) };
+    let start = *point + end * (thickness + gap) + side * depth;
+    Some((start, -end))
 }
 
 /// Bend line colours: up and down (theme tokens, legible on either theme and in every colour

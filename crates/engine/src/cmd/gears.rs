@@ -1149,7 +1149,6 @@ fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
         let profile_name = format!("Gear tooth profile {}", body_name);
         sector_sketch(s, g, 0.0, 0.0, &profile_name)?;
         if g.internal_gear {
-            println!("{}", g.rim_thickness + (g.outside_radius() * 2.0));
             run(
                 s,
                 "solid.cylinder",

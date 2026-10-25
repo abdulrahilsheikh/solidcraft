@@ -73,7 +73,7 @@ impl Gear {
             double_helix: false,
             axle_hole: true,
             internal_gear: false,
-            rim_thickness: 0.0,
+            rim_thickness: 10.0,
             offset_hole: false,
             offset_hole_offset: 10.0,
             offset_hole_size: 10.0,
@@ -259,15 +259,15 @@ impl Gear {
             self.simple,
             self.double_helix,
             self.axle_hole,
-            self.internal_gear,
-            self.rim_thickness,
             self.offset_hole,
             self.offset_hole_offset,
             self.offset_hole_size,
             self.profile_shift,
             self.clearance,
             self.head_tolerance,
-            self.reversed_backlash
+            self.reversed_backlash,
+            self.internal_gear,
+            self.rim_thickness,
         )
     }
 
@@ -323,7 +323,7 @@ impl Gear {
 
         gear.internal_gear = extra.get("ig").is_some_and(|value| *value == "true");
 
-        gear.rim_thickness = extra.get("rh").and_then(|value| value.parse::<f64>().ok()).unwrap_or(0.0);
+        gear.rim_thickness = extra.get("rh").and_then(|value| value.parse::<f64>().ok()).unwrap_or(10.0);
 
         if gear.internal_gear {
             // Internal gears do not support axle or offset holes.
@@ -361,6 +361,8 @@ fn library(_s: &mut Session, p: &Value) -> Result<Value> {
             "double_helix": false,
             "axle_hole": true,
             "axle_hole_size": 8.0,
+            "rim_thickness":10.0,
+            "internal_gear":false,
             "offset_hole": false,
             "offset_hole_offset": 10.0,
             "offset_hole_size": 10.0,
@@ -1230,6 +1232,8 @@ fn gear_properties(g: &Gear) -> Value {
         "bore": g.bore,
         "axle_hole": g.axle_hole,
         "axle_hole_size": g.bore,
+        "internal_gear": g.internal_gear,
+        "rim_thickness": g.rim_thickness,
         "pressure_angle": g.pressure_angle,
         "backlash": g.backlash,
         "effective_backlash": g.effective_backlash(),

@@ -1267,7 +1267,17 @@ fn gear_properties(g: &Gear) -> Value {
 fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let g = read_gear(p, None)?;
 
-    let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| format!("Spur Gear M{} Z{}", g.module, g.teeth));
+    let count = s
+        .model
+        .state()
+        .bodies
+        .iter()
+        .filter(|body| body.name.starts_with(&format!("{} Gear M{} Z{}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth)))
+        .count();
+
+    let name = str_(p, "name")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} Gear M{} Z{} - {}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth, count + 1));
 
     let active = s.active_component;
 
@@ -1366,7 +1376,17 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
         .parts
         .insert(component, solidcraft_doc::StandardPart { family: "spur_gear".to_string(), size: g.encode(), length: Some(g.face_width) });
 
-    let name = format!("Spur Gear M{} Z{}", g.module, g.teeth);
+    let count = s
+        .model
+        .state()
+        .bodies
+        .iter()
+        .filter(|body| body.name.starts_with(&format!("{} Gear M{} Z{}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth)))
+        .count();
+
+    let name = str_(p, "name")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} Gear M{} Z{} - {}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth, count + 1));
 
     if let Some(c) = s.doc_mut().components.iter_mut().find(|c| c.id == component) {
         c.name = name.clone();

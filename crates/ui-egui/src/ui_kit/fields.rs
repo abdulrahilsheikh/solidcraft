@@ -236,6 +236,14 @@ fn editor_reserving(ui: &mut Ui, value: &mut String, hint: &str, completion: boo
         edit = edit.margin(egui::Margin { left: inset, right: inset.saturating_add(reserve.round() as i8), top: 0, bottom: 0 });
     }
     let response = ui.add_sized(vec2(width, row_height()), edit);
+    if completion && ui.is_enabled() {
+        ui.ctx().data_mut(|data| {
+            let id = egui::Id::new("sc_value_fields");
+            if data.get_temp::<Vec<(egui::Id, usize)>>(id).is_some() {
+                data.get_temp_mut_or_default::<Vec<(egui::Id, usize)>>(id).push((response.id, value.chars().count()));
+            }
+        });
+    }
     crate::theme::TabAccent::number_focus(ui, &response);
     t.input_bevel(ui, &response);
     let label = crate::i18n::tr_label(label(ui));
@@ -514,6 +522,20 @@ pub(crate) fn length_field(ui: &mut Ui, value: &mut f64, units: &str, decimals: 
     response
 }
 
+/// A model-space length with tool-specific bounds and drag step, shown in design units.
+pub(crate) fn bounded_length_field(
+    ui: &mut Ui,
+    value: &mut f64,
+    units: &str,
+    decimals: u8,
+    range: std::ops::RangeInclusive<f64>,
+    speed: f64,
+) -> Response {
+    let response = ui.add(length_drag(value, units, decimals).range(range).speed(speed));
+    scenario::publish_target(&format!("dialog:length:{}", label(ui)), response.rect);
+    response
+}
+
 /// Angle in degrees, dragged or typed. Tokens: control_height, scope control/font tokens.
 pub(crate) fn angle_field(ui: &mut Ui, value: &mut f64) -> Response {
     let response = ui.add(egui::DragValue::new(value).speed(1.0).suffix(" deg").custom_parser(crate::prefs::parse_number));
@@ -622,6 +644,8 @@ pub(crate) fn canvas_value_field(ui: &mut Ui, id: egui::Id, value: &mut String, 
     }
     let response = ui.add(edit);
     t.input_bevel(ui, &response);
+    let field = (ui.ctx().cumulative_pass_nr(), response.id, value.chars().count());
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("sc_canvas_value_focus"), field));
     response
 }
 

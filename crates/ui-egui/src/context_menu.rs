@@ -347,22 +347,6 @@ pub fn radial_items(app: &SolveApp) -> Vec<Item> {
         cmd(app, "solid.move", "Move/Copy"),
     ]
 }
-fn rand_color() -> [u8; 3] {
-    use web_time::{SystemTime, UNIX_EPOCH};
-
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-
-    let mut x = n ^ n.rotate_left(17);
-
-    let mut next = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        60 + (x % 161) as u8
-    };
-
-    [next(), next(), next()]
-}
 /// The list of a menu (under the ring for the viewport).
 pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
     let mut v = match target {
@@ -455,11 +439,7 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
                 item.children.push(child);
             }
             item.children.push(Item::sep());
-            item.children.push(cmd(app, "appearance.assign", "Remove override").with(targets.clone()));
-
-            let random = act("ui.randomColor", "Random Color", "appearance").with(targets.clone());
-
-            item.children.push(random);
+            item.children.push(cmd(app, "appearance.assign", "Remove override").with(targets));
         }
     }
     v
@@ -1405,18 +1385,6 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.editFeature" => {
             if let Some(f) = id_of(&p, "feature") {
                 app.edit_feature(f);
-            }
-        }
-        "ui.randomColor" => {
-            let color = rand_color();
-
-            let mut params = p.clone();
-            params["color"] = json!(crate::dialogs_appearance::hex(color));
-            params["opacity"] = json!(1.0);
-            params.as_object_mut().map(|p| p.remove("appearance"));
-
-            if let Err(e) = app.session.execute("appearance.assign", &params) {
-                app.set_status(e.to_string(), true);
             }
         }
         "ui.appearance" => {

@@ -820,7 +820,7 @@ fn run(s: &mut Session, id: &str, p: Value) -> Result<Value> {
     s.execute(id, &p)
 }
 
-fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, name: &str) -> Result<()> {
+fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, name: &str) -> Result<String> {
     use std::f64::consts::PI;
 
     let (sin, cos) = start_rotation.sin_cos();
@@ -967,12 +967,9 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         )?;
     }
 
-    // let tip_angle = tip[1].atan2(tip[0]);
-
     let head_arc_start = if g.head_fillet_radius > 0.0 { tip[1].atan2(tip[0]) } else { tip[1].atan2(tip[0]) };
 
     let tip_sweep = -head_arc_start;
-    // let tip_sweep = -tip_angle;
 
     if !(tip_sweep > 1e-9 && tip_sweep < PI) {
         return Err(bad("gears", "the involute tip is outside its tooth sector"));
@@ -1080,9 +1077,44 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
         }),
     )?;
 
-    run(s, "sketch.finish", json!({}))?;
+    if g.internal_gear {
+        let hole_r = g.outside_radius() + g.rim_thickness;
+        if hole_r > 0.0 {
+            run(s, "sketch.edit", json!({"sketch": name}))?;
+            run(
+                s,
+                "sketch.circle.center",
+                json!({
+                    "center": [0.0, 0.0],
+                    "radius": hole_r
+                }),
+            )?;
+        }
+    } else {
+        let _ = run(s, "sketch.edit", json!({"sketch": name}));
+        if g.axle_hole && g.bore > 0.0 {
+            run(
+                s,
+                "sketch.circle.center",
+                json!({
+                    "center": [0.0, 0.0],
+                    "radius": g.bore / 2.0
+                }),
+            )?;
+        }
+        if g.offset_hole {
+            run(
+                s,
+                "sketch.circle.center",
+                json!({
+                    "center": [g.offset_hole_offset, 0.0],
+                    "radius": g.offset_hole_size / 2.0
+                }),
+            )?;
+        }
+    }
 
-    Ok(())
+    Ok(name.to_string())
 }
 
 fn helical_sweep(
@@ -1096,10 +1128,47 @@ fn helical_sweep(
     operation: &str,
     body_name: &str,
 ) -> Result<()> {
-    let profile_name = format!("Gear profile {suffix}");
+    let profile_name = sector_sketch(s, g, start, start_rotation, &format!("Gear profile {suffix}"))?;
     let path_name = format!("Gear path {suffix}");
     let path_id = format!("gear_path_{suffix}");
-    sector_sketch(s, g, start, start_rotation, &profile_name)?;
+    if g.internal_gear {
+        let hole_r = g.outside_radius() + g.rim_thickness;
+        if hole_r > 0.0 {
+            run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
+            run(
+                s,
+                "sketch.circle.center",
+                json!({
+                    "center": [0.0, 0.0],
+                    "radius": hole_r
+                }),
+            )?;
+            run(s, "sketch.finish", json!({}))?;
+        }
+    } else {
+        run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
+        if g.axle_hole && g.bore > 0.0 {
+            run(
+                s,
+                "sketch.circle.center",
+                json!({
+                    "center": [0.0, 0.0],
+                    "radius": g.bore / 2.0
+                }),
+            )?;
+        }
+        if g.offset_hole {
+            run(
+                s,
+                "sketch.circle.center",
+                json!({
+                    "center": [g.offset_hole_offset, 0.0],
+                    "radius": g.offset_hole_size / 2.0
+                }),
+            )?;
+        }
+        run(s, "sketch.finish", json!({}))?;
+    }
     run(s, "sketch.create", json!({"plane": "XZ", "offset": "0 mm", "name": path_name}))?;
     run(s, "sketch.line", json!({"points": [[0, -start], [0, -end]], "closed": false, "ids": [path_id]}))?;
     run(s, "sketch.finish", json!({}))?;
@@ -1146,21 +1215,46 @@ fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
     let _frame = crate::frames::local_geometry();
 
     if g.helix_angle == 90.0 {
-        let profile_name = format!("Gear tooth profile {}", body_name);
-        sector_sketch(s, g, 0.0, 0.0, &profile_name)?;
+        let profile_name = sector_sketch(s, g, 0.0, 0.0, &format!("Gear tooth profile {}", body_name))?;
         if g.internal_gear {
-            run(
-                s,
-                "solid.cylinder",
-                json!({
-                    "diameter": format!("{} mm",g.rim_thickness + (g.outside_radius() * 2.00)),
-                    "height": format!("{} mm", g.face_width ),
-                    "base": [0.0, 0.0, 0.0],
-                    "axis": [0, 0, 1],
-                    "operation": "new"
-                }),
-            )?;
+            let hole_r = g.outside_radius() + g.rim_thickness;
+            if hole_r > 0.0 {
+                run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
+                run(
+                    s,
+                    "sketch.circle.center",
+                    json!({
+                        "center": [0.0, 0.0],
+                        "radius": hole_r
+                    }),
+                )?;
+                run(s, "sketch.finish", json!({}))?;
+            }
+        } else {
+            run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
+            if g.axle_hole && g.bore > 0.0 {
+                run(
+                    s,
+                    "sketch.circle.center",
+                    json!({
+                        "center": [0.0, 0.0],
+                        "radius": g.bore / 2.0
+                    }),
+                )?;
+            }
+            if g.offset_hole {
+                run(
+                    s,
+                    "sketch.circle.center",
+                    json!({
+                        "center": [g.offset_hole_offset, 0.0],
+                        "radius": g.offset_hole_size / 2.0
+                    }),
+                )?;
+            }
+            run(s, "sketch.finish", json!({}))?;
         }
+
         run(
             s,
             "solid.extrude",
@@ -1168,7 +1262,7 @@ fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
                 "sketch": profile_name,
                 "distance": format!("{} mm", g.face_width),
                 "direction": "positive",
-                "operation": if g.internal_gear {"cut"}else{"new"},
+                "operation": "new",
                 "name": "Gear",
                 "body_name": body_name
             }),
@@ -1191,28 +1285,7 @@ fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
     } else {
         helical_sweep(s, g, 0.0, g.face_width, 0.0, g.twist(), "single", "new", body_name)?;
     }
-    if !g.internal_gear {
-        let mut holes = Vec::new();
-        if g.axle_hole && g.bore > 0.0 {
-            holes.push((0.0, 0.0, g.bore));
-        }
-        if g.offset_hole {
-            holes.push((g.offset_hole_offset, 0.0, g.offset_hole_size));
-        }
-        for (x, y, diameter) in holes {
-            run(
-                s,
-                "solid.cylinder",
-                json!({
-                    "diameter": format!("{diameter} mm"),
-                    "height": format!("{} mm", g.face_width + 2.0),
-                    "base": [x, y, -1],
-                    "axis": [0, 0, 1],
-                    "operation": "cut"
-                }),
-            )?;
-        }
-    }
+    if !g.internal_gear {}
 
     Ok(())
 }
@@ -1331,10 +1404,7 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
 
-    let component = s
-        .doc
-        .find_component(&component_key)
-        .ok_or_else(|| bad("gears.resize", format!("no component `{component_key}`")))?;
+    let component = s.doc.find_component(&component_key).ok_or_else(|| bad("gears.resize", format!("no component `{component_key}`")))?;
 
     let part = s
         .doc

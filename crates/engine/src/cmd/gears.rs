@@ -134,14 +134,8 @@ impl Gear {
         if self.simple { (points / 4).max(4) } else { points }
     }
 
-    #[cfg(test)]
     fn arc_segments(&self) -> usize {
         (self.involute_segments() / 3).max(4)
-    }
-
-    #[cfg(test)]
-    fn root_fillet_segments(&self) -> usize {
-        (self.involute_segments() / 4).max(4)
     }
 
     fn validate(&self) -> std::result::Result<(), String> {
@@ -484,636 +478,245 @@ fn positive_angle_delta(from: f64, to: f64) -> f64 {
     (to - from).rem_euclid(TAU)
 }
 
-fn polyline_length(points: &[[f64; 2]]) -> f64 {
-    points.windows(2).map(|pair| (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1])).sum()
-}
-
-fn point_at_polyline_distance(points: &[[f64; 2]], distance: f64) -> Option<[f64; 2]> {
-    if points.len() < 2 || !distance.is_finite() || distance < 0.0 {
-        return None;
-    }
-    let mut remaining = distance;
-    for pair in points.windows(2) {
-        let dx = pair[1][0] - pair[0][0];
-        let dy = pair[1][1] - pair[0][1];
-        let length = dx.hypot(dy);
-        if remaining <= length {
-            let t = if length > 0.0 { remaining / length } else { 0.0 };
-            return Some([pair[0][0] + dx * t, pair[0][1] + dy * t]);
-        }
-        remaining -= length;
-    }
-    points.last().copied()
-}
-
-#[cfg(test)]
-fn root_fillet_points(root_radius: f64, angle: f64, side: f64, radius: f64, segments: usize) -> Vec<[f64; 2]> {
-    let (sin, cos) = angle.sin_cos();
-    let center_distance = root_radius + radius;
-    let tangent_distance = (center_distance * center_distance - radius * radius).sqrt();
-    let center = [tangent_distance * cos - side * radius * sin, tangent_distance * sin + side * radius * cos];
-    let root_point = [root_radius * center[0] / center_distance, root_radius * center[1] / center_distance];
-    let flank_point = [tangent_distance * cos, tangent_distance * sin];
-    let start = (root_point[1] - center[1]).atan2(root_point[0] - center[0]);
-    let end = (flank_point[1] - center[1]).atan2(flank_point[0] - center[0]);
-    let sweep = if side > 0.0 { (end - start).rem_euclid(std::f64::consts::TAU) } else { -(start - end).rem_euclid(std::f64::consts::TAU) };
-
-    (0..=segments)
-        .map(|i| {
-            let a = start + sweep * i as f64 / segments as f64;
-            [center[0] + radius * a.cos(), center[1] + radius * a.sin()]
-        })
-        .collect()
-}
-
-/// One external spur-gear tooth centered on +X.
-///
-/// Returns a closed polygon without repeating the first point.
-/// The root ends extend into the root cylinder so the extruded
-/// tooth can be joined to the cylinder.
-#[cfg(test)]
-fn one_tooth(g: &Gear) -> Result<Vec<[f64; 2]>> {
-    one_tooth_with_resolution(g, g.involute_segments(), g.arc_segments(), g.root_fillet_segments())
-}
-
-#[cfg(test)]
-fn one_tooth_with_resolution(g: &Gear, involute_segments: usize, tip_arc_segments: usize, fillet_segments: usize) -> Result<Vec<[f64; 2]>> {
-    use std::f64::consts::PI;
-
-    let rb = g.base_radius();
-    let ra = g.outside_radius();
-    let rf = g.root_radius();
-
-    let alpha = g.pressure_angle.to_radians();
-    let half_pitch = PI / (2.0 * g.teeth as f64);
-
-    // Involute parameter at the pitch and outside circles.
-    let ta = involute_t(rb, ra);
-
-    // inv(alpha) = tan(alpha) - alpha.
-    // This aligns the tooth thickness at the pitch circle.
-    let inv_alpha = alpha.tan() - alpha;
-    let rotation = half_pitch + inv_alpha + (g.effective_backlash() / 2.0 + g.profile_shift * g.module * alpha.tan()) / g.pitch_radius();
-
-    // Generate both flanks from the base circle to the tip.
-    let mut left = Vec::with_capacity(involute_segments + 1);
-    let mut right = Vec::with_capacity(involute_segments + 1);
-
-    for i in 0..=involute_segments {
-        let t = ta * i as f64 / involute_segments as f64;
-        let p = involute_point(rb, t);
-
-        left.push(rotate_point(p, -rotation));
-        right.push(rotate_point([p[0], -p[1]], rotation));
-    }
-
-    let polar_angle = |p: &[f64; 2]| p[1].atan2(p[0]);
-
-    let left_base_angle = polar_angle(&left[0]);
-    let right_base_angle = polar_angle(&right[0]);
-
-    let left_tip = left[involute_segments];
-    let right_tip = right[involute_segments];
-
-    let left_tip_angle = polar_angle(&left_tip);
-    let right_tip_angle = polar_angle(&right_tip);
-
-    // Build the boundary in order:
-    //
-    // left root -> left flank -> tip arc ->
-    // right flank -> right root -> closing segment.
-    let mut pts = Vec::with_capacity(2 * (involute_segments + 1) + tip_arc_segments + 2);
-
-    // Extend the flanks down to the root circle when the root
-    // lies below the base circle. The closing chord lies inside
-    // the root cylinder, where the tooth overlaps the cylinder.
-    if rf < rb {
-        let root_point = [rf * left_base_angle.cos(), rf * left_base_angle.sin()];
-        if g.root_fillet_radius > 0.0 {
-            pts.extend(root_fillet_points(rf, left_base_angle, -1.0, g.root_fillet_radius, fillet_segments));
-        } else {
-            pts.push(root_point);
-        }
-        pts.extend(left.iter().copied());
-    } else {
-        pts.extend(left.iter().copied());
-    }
-    let left_tip = left[involute_segments];
-
-    // Connect the tooth tips with an outside-circle arc.
-    // Unwrap the angular interval explicitly to avoid crossing
-    // the -PI / +PI discontinuity.
-    let tip_delta = positive_angle_delta(left_tip_angle, right_tip_angle);
-
-    for i in 1..=tip_arc_segments {
-        let t = i as f64 / tip_arc_segments as f64;
-        let angle = left_tip_angle + tip_delta * t;
-
-        pts.push([ra * angle.cos(), ra * angle.sin()]);
-    }
-    let right_tip = right[involute_segments];
-
-    // Return down the right flank, excluding the tip because
-    // the tip arc already terminates at the right tip.
-    let right_flank = &right[..involute_segments];
-    for p in right_flank.iter().rev() {
-        pts.push(*p);
-    }
-
-    if rf < rb {
-        let root_point = [rf * right_base_angle.cos(), rf * right_base_angle.sin()];
-        if g.root_fillet_radius > 0.0 {
-            pts.extend(root_fillet_points(rf, right_base_angle, 1.0, g.root_fillet_radius, fillet_segments).into_iter().rev().skip(1));
-        } else {
-            pts.push(root_point);
-        }
-    }
-
-    if g.head_fillet_radius > 0.0 {
-        round_profile_corner(&mut pts, left_tip, g.head_fillet_radius, tip_arc_segments)?;
-        round_profile_corner(&mut pts, right_tip, g.head_fillet_radius, tip_arc_segments)?;
-    }
-
-    // Remove adjacent duplicate points.
-    let mut clean: Vec<[f64; 2]> = Vec::with_capacity(pts.len());
-
-    for p in pts {
-        if let Some(q) = clean.last() {
-            let dx = p[0] - q[0];
-            let dy = p[1] - q[1];
-
-            if dx * dx + dy * dy < 1e-16 {
-                continue;
-            }
-        }
-
-        clean.push(p);
-    }
-
-    // The sketch API closes the profile itself. Do not return
-    // a duplicate copy of the first vertex.
-    if clean.len() > 1
-        && let Some(last) = clean.last().copied()
-    {
-        let first = clean[0];
-
-        let dx = first[0] - last[0];
-        let dy = first[1] - last[1];
-
-        if dx * dx + dy * dy < 1e-16 {
-            clean.pop();
-        }
-    }
-
-    Ok(clean)
-}
-
-#[cfg(test)]
-fn round_profile_corner(points: &mut Vec<[f64; 2]>, target: [f64; 2], radius: f64, segments: usize) -> Result<()> {
-    let Some(index) = points.iter().position(|point| (point[0] - target[0]).hypot(point[1] - target[1]) <= 1e-8) else {
-        return Err(bad("gears", "head fillet could not find the tooth tip"));
-    };
-    let Some(corner) = points.get(index).copied() else {
-        return Err(bad("gears", "head fillet tooth tip is missing"));
-    };
-    let Some(previous) = index.checked_sub(1).and_then(|i| points.get(i)).copied() else {
-        return Err(bad("gears", "head fillet cannot round the first tooth point"));
-    };
-    let Some(next) = points.get(index + 1).copied() else {
-        return Err(bad("gears", "head fillet cannot round the last tooth point"));
-    };
-    let before = [previous[0] - corner[0], previous[1] - corner[1]];
-    let after = [next[0] - corner[0], next[1] - corner[1]];
-    let before_length = before[0].hypot(before[1]);
-    let after_length = after[0].hypot(after[1]);
-    if before_length <= 1e-9 || after_length <= 1e-9 {
-        return Err(bad("gears", "head fillet cannot round this tooth tip"));
-    }
-    let internal_angle = ((before[0] * after[0] + before[1] * after[1]) / (before_length * after_length)).clamp(-1.0, 1.0).acos();
-    let tangent_distance = radius / (internal_angle / 2.0).tan();
-    let mut remaining = tangent_distance;
-    let mut start_index = index;
-    let mut start = corner;
-    while start_index > 0 && remaining > 0.0 {
-        let Some(previous) = points.get(start_index - 1).copied() else { break };
-        let length = (start[0] - previous[0]).hypot(start[1] - previous[1]);
-        if length >= remaining {
-            let ratio = remaining / length;
-            start = [start[0] + (previous[0] - start[0]) * ratio, start[1] + (previous[1] - start[1]) * ratio];
-            remaining = 0.0;
-        } else {
-            remaining -= length;
-            start_index -= 1;
-            start = previous;
-        }
-    }
-    if remaining > 1e-8 {
-        return Err(bad("gears", "head_fillet_radius is too large for the tooth tip"));
-    }
-    remaining = tangent_distance;
-    let mut end_index = index;
-    let mut end = corner;
-    while end_index + 1 < points.len() && remaining > 0.0 {
-        let Some(next) = points.get(end_index + 1).copied() else { break };
-        let length = (next[0] - end[0]).hypot(next[1] - end[1]);
-        if length >= remaining {
-            let ratio = remaining / length;
-            end = [end[0] + (next[0] - end[0]) * ratio, end[1] + (next[1] - end[1]) * ratio];
-            remaining = 0.0;
-        } else {
-            remaining -= length;
-            end_index += 1;
-            end = next;
-        }
-    }
-    if remaining > 1e-8 {
-        return Err(bad("gears", "head_fillet_radius is too large for the tooth tip"));
-    }
-    let incoming = match points.get(start_index).zip(start_index.checked_sub(1).and_then(|i| points.get(i))) {
-        Some((end, start)) => [end[0] - start[0], end[1] - start[1]],
-        None => return Err(bad("gears", "head fillet cannot find the incoming tooth edge")),
-    };
-    let outgoing = match points.get(end_index + 1).zip(points.get(end_index)) {
-        Some((end, start)) => [end[0] - start[0], end[1] - start[1]],
-        None => return Err(bad("gears", "head fillet cannot find the outgoing tooth edge")),
-    };
-    let incoming_length = incoming[0].hypot(incoming[1]);
-    let outgoing_length = outgoing[0].hypot(outgoing[1]);
-    if incoming_length <= 1e-9 || outgoing_length <= 1e-9 {
-        return Err(bad("gears", "head fillet cannot round this tooth tip"));
-    }
-    let turn = incoming[0] * outgoing[1] - incoming[1] * outgoing[0];
-    let side = turn.signum();
-    let normal = [-incoming[1] / incoming_length * side, incoming[0] / incoming_length * side];
-    let center = [start[0] + normal[0] * radius, start[1] + normal[1] * radius];
-    let start_angle = (start[1] - center[1]).atan2(start[0] - center[0]);
-    let end_angle = (end[1] - center[1]).atan2(end[0] - center[0]);
-    let sweep = if side > 0.0 { positive_angle_delta(start_angle, end_angle) } else { -positive_angle_delta(end_angle, start_angle) };
-    let arc: Vec<[f64; 2]> = (0..=segments)
-        .map(|i| {
-            let angle = start_angle + sweep * i as f64 / segments as f64;
-            [center[0] + radius * angle.cos(), center[1] + radius * angle.sin()]
-        })
-        .collect();
-    if arc.last().is_none_or(|point| (point[0] - end[0]).hypot(point[1] - end[1]) > radius * 0.05) {
-        return Err(bad("gears", "head_fillet_radius cannot be fitted smoothly to the sampled tooth profile"));
-    }
-    points.splice(start_index..=end_index, arc);
-    Ok(())
-}
-
-#[cfg(test)]
-fn gear_outline(g: &Gear) -> Result<Vec<[f64; 2]>> {
-    let involute_segments = g.involute_segments();
-    let tip_arc_segments = g.arc_segments();
-    let fillet_segments = g.root_fillet_segments();
-    let root_arc_segments = g.arc_segments();
-    let tooth = one_tooth_with_resolution(g, involute_segments, tip_arc_segments, fillet_segments)?;
-    let Some(first) = tooth.first().copied() else {
-        return Ok(Vec::new());
-    };
-    let Some(last) = tooth.last().copied() else {
-        return Ok(Vec::new());
-    };
-    let pitch_step = std::f64::consts::TAU / g.teeth as f64;
-    let root_radius = g.root_radius();
-    let starts_inside_root = root_radius >= g.base_radius();
-    let mut outline = Vec::with_capacity(g.teeth as usize * (tooth.len() + root_arc_segments + 2));
-
-    for index in 0..g.teeth {
-        let rotation = pitch_step * index as f64;
-        let rotated_first = rotate_point(first, rotation);
-        let rotated_last = rotate_point(last, rotation);
-
-        if starts_inside_root {
-            let angle = rotated_first[1].atan2(rotated_first[0]);
-            outline.push([root_radius * angle.cos(), root_radius * angle.sin()]);
-        }
-        outline.extend(tooth.iter().map(|point| rotate_point(*point, rotation)));
-        if starts_inside_root {
-            let angle = rotated_last[1].atan2(rotated_last[0]);
-            outline.push([root_radius * angle.cos(), root_radius * angle.sin()]);
-        }
-
-        let from = rotated_last[1].atan2(rotated_last[0]);
-        let to = rotated_first[1].atan2(rotated_first[0]) + pitch_step;
-        let gap = positive_angle_delta(from, to);
-        for step in 1..=root_arc_segments {
-            let angle = from + gap * step as f64 / root_arc_segments as f64;
-            outline.push([root_radius * angle.cos(), root_radius * angle.sin()]);
-        }
-    }
-
-    let mut clean: Vec<[f64; 2]> = Vec::with_capacity(outline.len());
-    for point in outline {
-        if clean.last().is_none_or(|previous| (point[0] - previous[0]).hypot(point[1] - previous[1]) > 1e-8) {
-            clean.push(point);
-        }
-    }
-    if clean.len() > 1 && clean.first().zip(clean.last()).is_some_and(|(first, last)| (first[0] - last[0]).hypot(first[1] - last[1]) <= 1e-8) {
-        clean.pop();
-    }
-    Ok(clean)
-}
-
 fn run(s: &mut Session, id: &str, p: Value) -> Result<Value> {
     s.execute(id, &p)
 }
 
+use std::f64::consts::{PI, TAU};
+
+#[derive(Clone, Debug)]
+enum Seg {
+    Line([f64; 2], [f64; 2]),
+    Arc { start: [f64; 2], mid: [f64; 2], end: [f64; 2], center: [f64; 2] },
+    Spline(Vec<[f64; 2]>), // fit points on the involute
+}
+
+impl Seg {
+    fn start(&self) -> [f64; 2] {
+        match self {
+            Seg::Line(a, _) => *a,
+            Seg::Arc { start, .. } => *start,
+            Seg::Spline(p) => p[0],
+        }
+    }
+    fn end(&self) -> [f64; 2] {
+        match self {
+            Seg::Line(_, b) => *b,
+            Seg::Arc { end, .. } => *end,
+            Seg::Spline(p) => p[p.len() - 1],
+        }
+    }
+    fn mirrored_reversed(&self) -> Seg {
+        let m = |p: [f64; 2]| [p[0], -p[1]];
+        match self {
+            Seg::Line(a, b) => Seg::Line(m(*b), m(*a)),
+            Seg::Arc { start, mid, end, center } => Seg::Arc { start: m(*end), mid: m(*mid), end: m(*start), center: m(*center) },
+            Seg::Spline(p) => Seg::Spline(p.iter().rev().map(|q| m(*q)).collect()),
+        }
+    }
+    fn rotated(&self, a: f64) -> Seg {
+        let r = |p: [f64; 2]| rotate_point(p, a);
+        match self {
+            Seg::Line(s, e) => Seg::Line(r(*s), r(*e)),
+            Seg::Arc { start, mid, end, center } => Seg::Arc { start: r(*start), mid: r(*mid), end: r(*end), center: r(*center) },
+            Seg::Spline(p) => Seg::Spline(p.iter().map(|q| r(*q)).collect()),
+        }
+    }
+}
+
+/// Fillet-sized arc (< 180°) between two points on a circle.
+fn arc_between(c: [f64; 2], r: f64, from: [f64; 2], to: [f64; 2]) -> Seg {
+    let a0 = (from[1] - c[1]).atan2(from[0] - c[0]);
+    let a1 = (to[1] - c[1]).atan2(to[0] - c[0]);
+    let sweep = (a1 - a0 + PI).rem_euclid(TAU) - PI;
+    let a = a0 + sweep / 2.0;
+    Seg::Arc { start: from, mid: [c[0] + r * a.cos(), c[1] + r * a.sin()], end: to, center: c }
+}
+
+/// CCW arc about the origin (tip circle, root circle).
+fn arc_ccw_about_origin(r: f64, from: [f64; 2], to: [f64; 2]) -> Seg {
+    let a0 = from[1].atan2(from[0]);
+    let a1 = to[1].atan2(to[0]);
+    let a = a0 + positive_angle_delta(a0, a1) / 2.0;
+    Seg::Arc { start: from, mid: [r * a.cos(), r * a.sin()], end: to, center: [0.0, 0.0] }
+}
+
+/// One tooth centered on +X, CCW, starting on the root circle at the lower flank.
+fn tooth_segments(g: &Gear) -> Result<Vec<Seg>> {
+    let rb = g.base_radius();
+    let ra = g.outside_radius();
+    let rf = g.root_radius();
+    let (rr, rh) = (g.root_fillet_radius, g.head_fillet_radius);
+    let alpha = g.pressure_angle.to_radians();
+    let phi = PI / (2.0 * g.teeth as f64) + alpha.tan() - alpha
+        + (g.effective_backlash() / 2.0 + g.profile_shift * g.module * alpha.tan()) / g.pitch_radius();
+    let ta = involute_t(rb, ra);
+
+    let flank = |t: f64| rotate_point(involute_point(rb, t), -phi);
+    // fillet center: d > 0 inside the material, d < 0 in the gap
+    let center = |t: f64, d: f64| {
+        let p = involute_point(rb, t);
+        rotate_point([p[0] - d * t.sin(), p[1] + d * t.cos()], -phi)
+    };
+
+    let mut left: Vec<Seg> = Vec::new();
+    let t_lo;
+
+    if rf >= rb {
+        if rr > 0.0 {
+            let tc = (((rf + rr).powi(2) - rb * rb).sqrt() - rr) / rb;
+            let c = center(tc, -rr);
+            let k = rf / (rf + rr);
+            left.push(arc_between(c, rr, [c[0] * k, c[1] * k], flank(tc)));
+            t_lo = tc;
+        } else {
+            t_lo = involute_t(rb, rf);
+        }
+    } else {
+        // below the base circle the flank is a radial line
+        let (s, c) = (-phi).sin_cos();
+        let foot = [rb * c, rb * s];
+        if rr > 0.0 {
+            let cd = rf + rr;
+            let td = (cd * cd - rr * rr).sqrt();
+            if td > rb {
+                return Err(bad("gears", "root_fillet_radius is too large for this gear"));
+            }
+            let ctr = [td * c + rr * s, td * s - rr * c];
+            let k = rf / cd;
+            let tan_flank = [td * c, td * s];
+            left.push(arc_between(ctr, rr, [ctr[0] * k, ctr[1] * k], tan_flank));
+            left.push(Seg::Line(tan_flank, foot));
+        } else {
+            left.push(Seg::Line([rf * c, rf * s], foot));
+        }
+        t_lo = 0.0;
+    }
+
+    let mut head = None;
+    let t_hi;
+    if rh > 0.0 {
+        let disc = (ra - rh).powi(2) - rb * rb;
+        if disc < 0.0 {
+            return Err(bad("gears", "head_fillet_radius is too large for this gear"));
+        }
+        let tc = (rh + disc.sqrt()) / rb;
+        if tc <= t_lo + 1e-9 || tc >= ta {
+            return Err(bad("gears", "head_fillet_radius is too large for the tooth flank"));
+        }
+        let c = center(tc, rh);
+        let k = ra / (ra - rh);
+        head = Some(arc_between(c, rh, flank(tc), [c[0] * k, c[1] * k]));
+        t_hi = tc;
+    } else {
+        t_hi = ta;
+    }
+
+    let n = g.involute_segments().max(4);
+    left.push(Seg::Spline((0..=n).map(|i| flank(t_lo + (t_hi - t_lo) * i as f64 / n as f64)).collect()));
+
+    let left_tip = match head {
+        Some(h) => {
+            let e = h.end();
+            left.push(h);
+            e
+        }
+        None => flank(ta),
+    };
+    if left_tip[1] >= 0.0 {
+        return Err(bad("gears", "tooth tip has no width; reduce fillets, profile_shift, or backlash"));
+    }
+
+    let mirrored: Vec<Seg> = left.iter().rev().map(Seg::mirrored_reversed).collect();
+    left.push(arc_ccw_about_origin(ra, left_tip, [left_tip[0], -left_tip[1]]));
+    left.extend(mirrored);
+    Ok(left)
+}
+
+fn gear_profile(g: &Gear) -> Result<Vec<Seg>> {
+    let tooth = tooth_segments(g)?;
+    let (s0, e0) = (tooth[0].start(), tooth[tooth.len() - 1].end());
+    let pitch = TAU / g.teeth as f64;
+    let rf = g.root_radius();
+
+    let gap = positive_angle_delta(e0[1].atan2(e0[0]), s0[1].atan2(s0[0]) + pitch);
+    if gap > pitch {
+        return Err(bad("gears", "teeth overlap at the root; reduce backlash/profile_shift/fillets"));
+    }
+
+    let mut out = Vec::with_capacity(g.teeth as usize * (tooth.len() + 1));
+    for k in 0..g.teeth {
+        let rot = pitch * k as f64;
+        out.extend(tooth.iter().map(|s| s.rotated(rot)));
+        let a = rotate_point(e0, rot);
+        // reuse the exact start point on the wrap-around so the loop closes bit-for-bit
+        let b = if k + 1 == g.teeth { s0 } else { rotate_point(s0, pitch * (k + 1) as f64) };
+        if (a[0] - b[0]).hypot(a[1] - b[1]) > 1e-9 {
+            out.push(arc_ccw_about_origin(rf, a, b));
+        }
+    }
+    Ok(out)
+}
+fn flatten(segs: &[Seg], arc_steps: usize) -> Vec<[f64; 2]> {
+    let mut out = Vec::new();
+    for s in segs {
+        match s {
+            Seg::Line(a, _) => out.push(*a),
+            Seg::Arc { start, mid, center, .. } => {
+                let r = (start[0] - center[0]).hypot(start[1] - center[1]);
+                let a0 = (start[1] - center[1]).atan2(start[0] - center[0]);
+                let am = (mid[1] - center[1]).atan2(mid[0] - center[0]);
+                let sweep = 2.0 * ((am - a0 + PI).rem_euclid(TAU) - PI);
+                for i in 0..arc_steps {
+                    let a = a0 + sweep * i as f64 / arc_steps as f64;
+                    out.push([center[0] + r * a.cos(), center[1] + r * a.sin()]);
+                }
+            }
+            Seg::Spline(p) => out.extend_from_slice(&p[..p.len() - 1]),
+        }
+    }
+    out
+}
+
+fn gear_outline(g: &Gear) -> Result<Vec<[f64; 2]>> {
+    Ok(flatten(&gear_profile(g)?, g.arc_segments()))
+}
+
+/// Adds the non-tooth loops (rim circle for internal gears; bore/offset holes for external ones).
+fn add_profile_loops(s: &mut Session, g: &Gear, name: &str) -> Result<()> {
+    run(s, "sketch.edit", json!({"sketch": name}))?;
+    if g.internal_gear {
+        run(s, "sketch.circle.center", json!({"center": [0.0, 0.0], "radius": g.outside_radius() + g.rim_thickness}))?;
+    } else {
+        if g.axle_hole && g.bore > 0.0 {
+            run(s, "sketch.circle.center", json!({"center": [0.0, 0.0], "radius": g.bore / 2.0}))?;
+        }
+        if g.offset_hole {
+            run(s, "sketch.circle.center", json!({"center": [g.offset_hole_offset, 0.0], "radius": g.offset_hole_size / 2.0}))?;
+        }
+    }
+    run(s, "sketch.finish", json!({})).map(|_| ())
+}
+
 fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, name: &str) -> Result<String> {
-    use std::f64::consts::PI;
-
     let (sin, cos) = start_rotation.sin_cos();
-
     run(
         s,
         "sketch.create",
         json!({
-            "plane": {
-                "origin": [0, 0, start],
-                "x_dir": [cos, sin, 0],
-                "y_dir": [-sin, cos, 0]
-            },
+            "plane": { "origin": [0, 0, start], "x_dir": [cos, sin, 0], "y_dir": [-sin, cos, 0] },
             "name": name
         }),
     )?;
 
-    let rb = g.base_radius();
-    let ra = g.outside_radius();
-    let rf = g.root_radius();
-    let alpha = g.pressure_angle.to_radians();
-    let inv_alpha = alpha.tan() - alpha;
-
-    let tooth_half_thickness = PI / (2.0 * g.teeth as f64);
-
-    let flank_rotation =
-        tooth_half_thickness + inv_alpha + (g.effective_backlash() / 2.0 + g.profile_shift * g.module * alpha.tan()) / g.pitch_radius();
-
-    let end_t = involute_t(rb, ra);
-
-    let flank: Vec<[f64; 2]> = (0..=g.involute_segments())
-        .map(|i| {
-            let point = involute_point(rb, end_t * i as f64 / g.involute_segments() as f64);
-            rotate_point(point, -flank_rotation)
-        })
-        .collect();
-
-    let Some(base) = flank.first().copied() else {
-        return Err(bad("gears", "the involute flank is empty"));
-    };
-
-    let Some(tip) = flank.last().copied() else {
-        return Err(bad("gears", "the involute tip is missing"));
-    };
-
-    let root_angle = base[1].atan2(base[0]);
-    let sector_angle = -PI / g.teeth as f64;
-    let root_start_sweep = positive_angle_delta(sector_angle, root_angle);
-
-    if !(root_start_sweep > 1e-9 && root_start_sweep < PI) {
-        return Err(bad("gears", "the tooth does not fit inside its circular pattern sector"));
+    let outline = gear_outline(g)?;
+    if outline.is_empty() {
+        return Err(bad("gears", "the gear tooth profile is empty"));
     }
+    let points: Vec<Value> = outline.iter().map(|p| json!([p[0], p[1]])).collect();
+    run(s, "sketch.line", json!({"points": points, "closed": true, "ids": ["gear_profile"]}))?;
 
-    let sector_start = [rf * sector_angle.cos(), rf * sector_angle.sin()];
-
-    run(
-        s,
-        "sketch.line",
-        json!({
-            "points": [[0, 0], sector_start],
-            "closed": false,
-            "ids": ["gear_sector_boundary"]
-        }),
-    )?;
-
-    run(
-        s,
-        "sketch.arc.center_point",
-        json!({
-            "center": [0, 0],
-            "start": "gear_sector_boundary.end",
-            "sweep": root_start_sweep.to_degrees(),
-            "id": "gear_root_arc"
-        }),
-    )?;
-
-    let flank_length = polyline_length(&flank);
-    let head_bridge_length = 0.01;
-
-    let head_lead = if g.head_fillet_radius > 0.0 { g.head_fillet_radius + 0.01 } else { 0.0 };
-
-    if head_lead + head_bridge_length >= flank_length {
-        return Err(bad("gears", "the requested head fillet does not fit along the involute"));
-    }
-
-    let spline_end_distance = if g.head_fillet_radius > 0.0 { flank_length - head_lead - head_bridge_length } else { flank_length };
-
-    // Keep the root bridge fixed regardless of the root fillet radius.
-    run(
-        s,
-        "sketch.line",
-        json!({
-            "points": ["gear_root_arc.end", base],
-            "closed": false,
-            "ids": ["gear_root_bridge"]
-        }),
-    )?;
-
-    // Choose the spline endpoint so the remaining involute segment
-    // has approximately the requested head bridge length.
-    let head_contact =
-        point_at_polyline_distance(&flank, spline_end_distance).ok_or_else(|| bad("gears", "the involute head contact could not be calculated"))?;
-
-    let mut fit_values = Vec::with_capacity(flank.len());
-
-    fit_values.push(json!(base));
-
-    let mut distance = 0.0;
-
-    for (index, pair) in flank.windows(2).enumerate() {
-        distance += (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
-
-        if distance > 0.0 && distance < flank_length - head_lead - head_bridge_length {
-            if let Some(point) = flank.get(index + 1) {
-                fit_values.push(json!(point));
-            }
-        }
-    }
-
-    fit_values.push(json!(head_contact));
-
-    if fit_values.len() < 2 {
-        return Err(bad("gears", "the involute needs at least two fit points"));
-    }
-
-    let flank_result = run(s, "sketch.spline.fit_point", json!({"points": fit_values}))?;
-
-    let flank_id = flank_result["curves"]
-        .as_array()
-        .and_then(|curves| curves.first())
-        .and_then(Value::as_str)
-        .ok_or_else(|| bad("gears", "the involute spline was not created"))?;
-
-    // Create exactly one head bridge.
-    if g.head_fillet_radius > 0.0 {
-        run(
-            s,
-            "sketch.line",
-            json!({
-                "points": [format!("{flank_id}.end"), tip],
-                "closed": false,
-                "ids": ["gear_head_bridge"]
-            }),
-        )?;
-    }
-
-    let head_arc_start = if g.head_fillet_radius > 0.0 { tip[1].atan2(tip[0]) } else { tip[1].atan2(tip[0]) };
-
-    let tip_sweep = -head_arc_start;
-
-    if !(tip_sweep > 1e-9 && tip_sweep < PI) {
-        return Err(bad("gears", "the involute tip is outside its tooth sector"));
-    }
-
-    run(
-        s,
-        "sketch.arc.center_point",
-        json!({
-            "center": [0, 0],
-            "start": if g.head_fillet_radius > 0.0 {
-                "gear_head_bridge.end".to_string()
-            } else {
-                format!("{flank_id}.end")
-            },
-            "sweep": tip_sweep.to_degrees(),
-            "id": "gear_tip_arc"
-        }),
-    )?;
-
-    if g.root_fillet_radius > 0.0 {
-        run(
-            s,
-            "sketch.fillet",
-            json!({
-                "point": "gear_root_bridge.start",
-                "radius": g.root_fillet_radius
-            }),
-        )?;
-    }
-
-    if g.head_fillet_radius > 0.0 {
-        run(
-            s,
-            "sketch.fillet",
-            json!({
-                "point": "gear_head_bridge.end",
-                "radius": g.head_fillet_radius
-            }),
-        )?;
-    }
-
-    run(
-        s,
-        "sketch.line",
-        json!({
-            "points": ["gear_sector_boundary.start", [ra * 1.1, 0]],
-            "closed": false,
-            "construction": true,
-            "ids": ["gear_mirror_axis"]
-        }),
-    )?;
-
-    run(
-        s,
-        "sketch.construction",
-        json!({
-            "curves": ["gear_sector_boundary"],
-            "value": true
-        }),
-    )?;
-
-    let active = s.active_sketch.ok_or_else(|| bad("gears", "the gear sketch is not active"))?;
-
-    let state = s.model.state();
-
-    let sketch = state.sketch(active).ok_or_else(|| bad("gears", "the gear sketch is missing"))?;
-
-    let entities: Vec<String> = sketch.sketch.curves.iter().filter(|curve| !curve.construction).map(|curve| curve.id.clone()).collect();
-
-    if entities.is_empty() {
-        return Err(bad("gears", "the gear sector profile is empty"));
-    }
-
-    run(
-        s,
-        "sketch.mirror",
-        json!({
-            "entities": entities,
-            "line": "gear_mirror_axis"
-        }),
-    )?;
-
-    let active = s.active_sketch.ok_or_else(|| bad("gears", "the gear sketch is not active"))?;
-
-    let state = s.model.state();
-
-    let sketch = state.sketch(active).ok_or_else(|| bad("gears", "the gear sketch is missing"))?;
-
-    let pattern_entities: Vec<String> = sketch.sketch.curves.iter().filter(|curve| !curve.construction).map(|curve| curve.id.clone()).collect();
-
-    if !pattern_entities.is_empty() {
-        run(s, "sketch.constraint.fix", json!({"entities": pattern_entities}))?;
-    }
-
-    run(
-        s,
-        "sketch.pattern.circular",
-        json!({
-            "entities": pattern_entities,
-            "center": [0, 0],
-            "count": g.teeth,
-            "angle": 360,
-            "associative": false
-        }),
-    )?;
-
-    if g.internal_gear {
-        let hole_r = g.outside_radius() + g.rim_thickness;
-        if hole_r > 0.0 {
-            run(s, "sketch.edit", json!({"sketch": name}))?;
-            run(
-                s,
-                "sketch.circle.center",
-                json!({
-                    "center": [0.0, 0.0],
-                    "radius": hole_r
-                }),
-            )?;
-        }
-    } else {
-        let _ = run(s, "sketch.edit", json!({"sketch": name}));
-        if g.axle_hole && g.bore > 0.0 {
-            run(
-                s,
-                "sketch.circle.center",
-                json!({
-                    "center": [0.0, 0.0],
-                    "radius": g.bore / 2.0
-                }),
-            )?;
-        }
-        if g.offset_hole {
-            run(
-                s,
-                "sketch.circle.center",
-                json!({
-                    "center": [g.offset_hole_offset, 0.0],
-                    "radius": g.offset_hole_size / 2.0
-                }),
-            )?;
-        }
-    }
-
+    add_profile_loops(s, g, name)?; // the only place loops are added
     Ok(name.to_string())
 }
 
@@ -1128,67 +731,27 @@ fn helical_sweep(
     operation: &str,
     body_name: &str,
 ) -> Result<()> {
-    let profile_name = sector_sketch(s, g, start, start_rotation, &format!("Gear profile {suffix}"))?;
-    let path_name = format!("Gear path {suffix}");
+    let profile_name = sector_sketch(s, g, start, start_rotation, &format!("Gear profile {suffix} {body_name}"))?;
+    let path_name = format!("Gear path {suffix} {body_name}");
     let path_id = format!("gear_path_{suffix}");
-    if g.internal_gear {
-        let hole_r = g.outside_radius() + g.rim_thickness;
-        if hole_r > 0.0 {
-            run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
-            run(
-                s,
-                "sketch.circle.center",
-                json!({
-                    "center": [0.0, 0.0],
-                    "radius": hole_r
-                }),
-            )?;
-            run(s, "sketch.finish", json!({}))?;
-        }
-    } else {
-        run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
-        if g.axle_hole && g.bore > 0.0 {
-            run(
-                s,
-                "sketch.circle.center",
-                json!({
-                    "center": [0.0, 0.0],
-                    "radius": g.bore / 2.0
-                }),
-            )?;
-        }
-        if g.offset_hole {
-            run(
-                s,
-                "sketch.circle.center",
-                json!({
-                    "center": [g.offset_hole_offset, 0.0],
-                    "radius": g.offset_hole_size / 2.0
-                }),
-            )?;
-        }
-        run(s, "sketch.finish", json!({}))?;
-    }
+
     run(s, "sketch.create", json!({"plane": "XZ", "offset": "0 mm", "name": path_name}))?;
     run(s, "sketch.line", json!({"points": [[0, -start], [0, -end]], "closed": false, "ids": [path_id]}))?;
     run(s, "sketch.finish", json!({}))?;
-    run(
-        s,
-        "solid.sweep",
-        json!({
-            "sketch": profile_name,
-            "path_sketch": path_name,
-            "path": [path_id],
-            "twist": format!("{twist} rad"),
-            "operation": operation,
-            "name": format!("Helical gear {suffix}"),
-            "body_name": body_name,
-        }),
-    )
-    .map_err(|error| bad("gears", format!("helical gear sweep failed: {error}")))?;
+
+    let params = json!({
+        "sketch": profile_name,
+        "path_sketch": path_name,
+        "path": [path_id],
+        "twist": format!("{twist} rad"),
+        "operation": operation,
+        "name": format!("Helical gear {suffix}"),
+        "body_name": body_name,
+    });
+
+    run(s, "solid.sweep", params).map_err(|e| bad("gears", format!("helical gear sweep failed: {e}")))?;
     Ok(())
 }
-
 fn unique_gear_body_name(s: &Session, component: u64) -> Result<String> {
     let state = s.model.state();
     if state.body("Gear").is_none() {
@@ -1215,45 +778,8 @@ fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
     let _frame = crate::frames::local_geometry();
 
     if g.helix_angle == 90.0 {
-        let profile_name = sector_sketch(s, g, 0.0, 0.0, &format!("Gear tooth profile {}", body_name))?;
-        if g.internal_gear {
-            let hole_r = g.outside_radius() + g.rim_thickness;
-            if hole_r > 0.0 {
-                run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
-                run(
-                    s,
-                    "sketch.circle.center",
-                    json!({
-                        "center": [0.0, 0.0],
-                        "radius": hole_r
-                    }),
-                )?;
-                run(s, "sketch.finish", json!({}))?;
-            }
-        } else {
-            run(s, "sketch.edit", json!({"sketch": &profile_name}))?;
-            if g.axle_hole && g.bore > 0.0 {
-                run(
-                    s,
-                    "sketch.circle.center",
-                    json!({
-                        "center": [0.0, 0.0],
-                        "radius": g.bore / 2.0
-                    }),
-                )?;
-            }
-            if g.offset_hole {
-                run(
-                    s,
-                    "sketch.circle.center",
-                    json!({
-                        "center": [g.offset_hole_offset, 0.0],
-                        "radius": g.offset_hole_size / 2.0
-                    }),
-                )?;
-            }
-            run(s, "sketch.finish", json!({}))?;
-        }
+        // sector_sketch draws the tooth outline plus the rim/bore/offset loops and finishes the sketch.
+        let profile_name = sector_sketch(s, g, 0.0, 0.0, &format!("Gear tooth profile {body_name}"))?;
 
         run(
             s,
@@ -1285,7 +811,6 @@ fn build(s: &mut Session, g: &Gear, body_name: &str) -> Result<()> {
     } else {
         helical_sweep(s, g, 0.0, g.face_width, 0.0, g.twist(), "single", "new", body_name)?;
     }
-    if !g.internal_gear {}
 
     Ok(())
 }
@@ -1566,7 +1091,7 @@ mod tests {
                 .doc
                 .features
                 .iter()
-                .any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sketch { sketch, .. } if !sketch.patterns.is_empty()))
+                .any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sketch { sketch, .. } if sketch.patterns.is_empty()))
         );
         assert!(!session.doc.features.iter().any(|feature| feature.kind.type_name() == "CircularPatternFeature"));
     }
@@ -1591,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn gear_profile_uses_sketch_fillets_and_patterns_the_sector_before_extruding() {
+    fn gear_profile_computes_all_teeth_without_circular_pattern() {
         let mut session = Session::default();
         session
             .execute("gears.insert", &json!({"module": 2, "teeth": 8, "height": 6, "bore": 2, "root_fillet_radius": 0.2, "head_fillet_radius": 0.05}))
@@ -1602,7 +1127,7 @@ mod tests {
                 .doc
                 .features
                 .iter()
-                .any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sketch { sketch, .. } if !sketch.patterns.is_empty()))
+                .any(|feature| matches!(&feature.kind, solidcraft_doc::FeatureKind::Sketch { sketch, .. } if sketch.patterns.is_empty()))
         );
         let state = session.world_state();
         assert_eq!(state.bodies.len(), 1);
@@ -1610,22 +1135,6 @@ mod tests {
         let measure = solidcraft_kernel::measure(&gear.body).unwrap();
         assert!(measure.volume > 0.0);
         assert!((measure.bbox.max.z - 6.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn backlash_narrows_both_flanks_of_the_tooth() {
-        let original = read_gear(&json!({"teeth": 8}), None).unwrap();
-        let adjusted = read_gear(&json!({"teeth": 8, "backlash": 0.2}), None).unwrap();
-        let original_tooth = one_tooth(&original).unwrap();
-        let adjusted_tooth = one_tooth(&adjusted).unwrap();
-        let angle = |point: [f64; 2]| point[1].atan2(point[0]);
-        let half_shift = adjusted.backlash / (2.0 * adjusted.pitch_radius());
-        let left_shift = angle(adjusted_tooth[0]) - angle(original_tooth[0]);
-        let original_right = original_tooth[original_tooth.len() - 1];
-        let adjusted_right = adjusted_tooth[adjusted_tooth.len() - 1];
-        let right_shift = angle(adjusted_right) - angle(original_right);
-        assert!((left_shift + half_shift).abs() < 1e-12);
-        assert!((right_shift - half_shift).abs() < 1e-12);
     }
 
     #[test]
@@ -1694,42 +1203,5 @@ mod tests {
 
         let legacy = Gear::decode("m=2;z=24;b=8;pa=20;uc=true", 10.0).unwrap();
         assert!(!legacy.encode().contains("uc="));
-    }
-
-    #[test]
-    fn root_fillet_profile_is_tangent_to_root_and_flank() {
-        let gear = read_gear(&json!({"teeth": 24, "root_fillet_radius": 0.4}), None).unwrap();
-        let rotation = std::f64::consts::PI / (2.0 * gear.teeth as f64) + gear.pressure_angle.to_radians().tan() - gear.pressure_angle.to_radians();
-        let angle = -rotation;
-        let arc = root_fillet_points(gear.root_radius(), angle, -1.0, gear.root_fillet_radius, gear.root_fillet_segments());
-        let first = arc.first().copied().unwrap();
-        let last = arc.last().copied().unwrap();
-        assert!((first[0].hypot(first[1]) - gear.root_radius()).abs() < 1e-12);
-        assert!(first[1].atan2(first[0]) < angle);
-        let tangent_radius = (gear.root_radius().powi(2) + 2.0 * gear.root_radius() * gear.root_fillet_radius).sqrt();
-        assert!((last[0].hypot(last[1]) - tangent_radius).abs() < 1e-12);
-        let side = -1.0;
-        let center = [
-            tangent_radius * angle.cos() - side * gear.root_fillet_radius * angle.sin(),
-            tangent_radius * angle.sin() + side * gear.root_fillet_radius * angle.cos(),
-        ];
-        assert!(arc.iter().all(|p| ((p[0] - center[0]).hypot(p[1] - center[1]) - gear.root_fillet_radius).abs() < 1e-12));
-
-        let tooth = one_tooth(&gear).unwrap();
-        assert!(
-            tooth
-                .iter()
-                .take(arc.len())
-                .zip(&arc)
-                .all(|(actual, expected)| { (actual[0] - expected[0]).abs() < 1e-12 && (actual[1] - expected[1]).abs() < 1e-12 })
-        );
-        let base = rotate_point(involute_point(gear.base_radius(), 0.0), angle);
-        assert!((tooth[arc.len()][0] - base[0]).hypot(tooth[arc.len()][1] - base[1]) < 1e-12);
-        let transition = [tooth[arc.len()][0] - last[0], tooth[arc.len()][1] - last[1]];
-        let tangent = [angle.cos(), angle.sin()];
-        assert!((transition[0] * tangent[1] - transition[1] * tangent[0]).abs() < 1e-12);
-        let right_arc = root_fillet_points(gear.root_radius(), -angle, 1.0, gear.root_fillet_radius, gear.root_fillet_segments());
-        assert!(arc.iter().zip(right_arc.iter()).all(|(left, right)| (left[0] - right[0]).abs() < 1e-12 && (left[1] + right[1]).abs() < 1e-12));
-        assert!(tooth.len() > one_tooth(&read_gear(&json!({"teeth":24}), None).unwrap()).unwrap().len());
     }
 }

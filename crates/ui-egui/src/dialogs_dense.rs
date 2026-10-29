@@ -184,13 +184,14 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
     if let Some(key) = manage_hint {
         ui_kit::text(ui, tr(key), ui_kit::Text::Hint("manage"));
     }
-    placement_row(d, ui, &app.session);
-    if matches!(&d.kind, Kind::Hole { opts, .. } if !opts.multiple) {
-        // Each reference edge with its distance (#37).
-        enter |= crate::hole_refs::input_rows(d, ui, &app.session);
+    placement_row(d, ui, app);
+    if crate::hole_refs::takes(d) {
+        // Each reference edge with its distance (#37, #6380).
+        enter |= crate::hole_refs::input_rows(d, ui, &app.session, app.preferences.origin_plane_names);
     } else {
-        input_rows(d, ui, &app.session);
+        input_rows(d, ui, &app.session, app.preferences.origin_plane_names);
     }
+    d.sync_material(&app.session);
     match &mut d.kind {
         Kind::Material { index, editor } => crate::material_editor::rows(app, ui, index, editor),
         Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
@@ -198,7 +199,7 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
         Kind::Part(k) => enter |= crate::dialogs_parts::rows(app, ui, k, &d.inputs),
         Kind::PartSize(k) => enter |= crate::dialogs_part_size::rows(app, ui, k),
         Kind::Gear(k) => enter |= crate::dialogs_gears::rows(app, ui, k),
-        Kind::SaveMesh(k) => enter |= crate::dialogs_save_mesh::rows(app, ui, k),
+        Kind::SaveMesh(k) => enter |= crate::dialogs_save_mesh::rows(app, ui, k, &mut d.inputs),
         Kind::ViewDxf { dashed, tolerance } => crate::dialogs_view_dxf::rows(app, ui, dashed, tolerance),
         Kind::InsertDrawing(p) => crate::dialogs_insert_drawing::rows(ui, p),
         Kind::Sketch => {
@@ -276,14 +277,11 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
             if two_sided(*direction) {
                 enter |= expr_row(ui, "Distance 2", distance2);
             }
-            form_row(ui, "Operation", |ui| {
-                let before = *operation;
-                combo(ui, "ex_op", &OP_LABELS, operation);
-                // A choice made by hand sticks.
-                if *operation != before {
-                    *auto_op = false;
-                }
-            });
+            // A choice made by hand sticks, the shown one included (#6901): Extrude's own choice
+            // stops before the next frame makes it.
+            if crate::op_auto::op_row(ui, "ex_op", operation) {
+                *auto_op = false;
+            }
             ui_kit::section(ui, "extrude_options", "Options", true, |ui| {
                 let was_thin = *thin;
                 let was_direction = *direction;
@@ -576,6 +574,26 @@ fn extra_options(ui: &mut egui::Ui, id: &str, extra: &mut serde_json::Map<String
     }
 }
 
+/// The message a primitive's size field is labelled with, by its parameter name: "Section size",
+/// not `section_size`.
+pub(crate) fn primitive_label(key: &str) -> &str {
+    match key {
+        "length" => "ui.length",
+        "width" => "ui.width",
+        "height" => "ui.height",
+        "diameter" => "ui.diameter",
+        "radius" => "ui.radius",
+        "top_diameter" => "ui.top_diameter",
+        "top_radius" => "ui.top_radius",
+        "major" => "ui.major_radius",
+        "minor" => "ui.minor_radius",
+        "revolutions" => "ui.revolutions",
+        "pitch" => "ui.pitch",
+        "section_size" => "ui.section_size",
+        _ => key,
+    }
+}
+
 /// The coil's section, where the section sits on the diameter, the way it turns and where it
 /// starts (#3862). A default stays out of the parameters, so OK on an unchanged edit keeps the coil.
 fn coil_rows(ui: &mut egui::Ui, extra: &mut serde_json::Map<String, Value>) -> bool {
@@ -654,7 +672,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
                     });
                 }
             }
-            choice_row(ui, "Operation", "rv_op", operation, &OP_LABELS);
+            crate::op_auto::op_row(ui, "rv_op", operation);
         }
         Kind::Shell { thickness } => {
             // The direction below says which side the wall grows to; the label stays short enough
@@ -713,10 +731,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
                 ui_kit::segmented(ui, &mut i, &["Emboss", "Deboss"], Default::default());
                 *deboss = i == 1;
             });
-            ui.add(
-                egui::Label::new("Orthogonal line profiles tangent to one supported cylinder wrap automatically. Pick a wall to choose a target.")
-                    .wrap(),
-            );
+            ui.add(egui::Label::new(crate::i18n::tr("ui.emboss_wrap_note")).wrap());
         }
         Kind::Align { flip } => {
             // Where on the picked face or edge to snap: as picked (a face turns to meet
@@ -729,11 +744,10 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             ui_kit::options(ui, "feature_options", &mut [("Flip", flip)]);
         }
         Kind::BoundaryFill { operation, cells, .. } => {
-            form_row(ui, "Cells", |ui| {
-                if cells.is_empty() {
-                    ui.label(RichText::new(tr("Pick the tool bodies")).color(Tokens::get().text_dim));
-                }
-            });
+            form_row(ui, "Cells", |_| {});
+            if cells.is_empty() {
+                ui_kit::status_line(ui, "Pick the tool bodies", ui_kit::StatusTone::Dim);
+            }
             for (i, (_, label, on)) in cells.iter_mut().enumerate() {
                 form_row(ui, &format!("Cell {}", i + 1), |ui| {
                     ui_kit::checkbox(ui, label.as_str(), on);
@@ -744,7 +758,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         }
         Kind::PathPattern { count, spacing } => {
             enter |= quantity_row(ui, &app.session.doc, "Quantity", count);
-            enter |= expr_row(ui, "Spacing", spacing);
+            enter |= expr_row(ui, if d.extra.contains_key("distance") { "Distance" } else { "Spacing" }, spacing);
         }
         Kind::Pipe { diameter, wall, operation } => {
             enter |= expr_row(ui, "Diameter", diameter);
@@ -782,40 +796,46 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             }
         }
         Kind::Loft { operation, rail_fit } => {
-            choice_row(ui, "Operation", "lf_op", operation, &OP_LABELS);
+            crate::op_auto::op_row(ui, "lf_op", operation);
             crate::dialogs_sweep::rail_fit_row(ui, "lf", rail_fit);
         }
         Kind::Sweep { operation, opts } => {
             enter |= crate::dialogs_sweep::rows_with(ui, opts, "sw", |ui| {
-                choice_row(ui, "Operation", "sw_op", operation, &OP_LABELS);
+                crate::op_auto::op_row(ui, "sw_op", operation);
             });
         }
         k @ Kind::Move { .. } => {
             enter |= crate::dialogs_move::rows(ui, k);
             extra_options(ui, "move_options", &mut d.extra, &[("Create Copy", "copy")]);
         }
-        Kind::Primitive { cmd, fields, operation, at } => {
+        Kind::Primitive { cmd, fields, operation, at, .. } => {
             let from_sketch = *cmd == "solid.coil" && d.inputs.first().is_some_and(|i| i.accept & selection::PROFILES != 0 && !i.items.is_empty());
             for (k, v) in fields.iter_mut() {
                 if from_sketch && (*k == "diameter" || *k == "section_size") {
                     continue;
                 }
-                enter |= expr_row(ui, k, v);
+                enter |= expr_row(ui, primitive_label(k), v);
             }
             if *cmd == "solid.coil" {
                 enter |= coil_rows(ui, &mut d.extra);
+            }
+            if at.is_none() {
+                enter |= crate::primitive_placement::rows(ui, &app.session, cmd, &mut d.extra);
             }
             if let Some((p, _)) = *at {
                 form_row(ui, "Position", |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!("{:.2}, {:.2}, {:.2}", p.x, p.y, p.z));
-                        if ui_kit::button(ui, "×", ui_kit::Button::Small).on_hover_text(tr("Place at the origin instead")).clicked() {
+                        // A cylinder's place is its Face pick, cleared there.
+                        if *cmd != "solid.cylinder"
+                            && ui_kit::button(ui, "×", ui_kit::Button::Small).on_hover_text(tr("Place at the origin instead")).clicked()
+                        {
                             *at = None;
                         }
                     });
                 });
             }
-            choice_row(ui, "Operation", "pr_op", operation, &OP_LABELS);
+            crate::op_auto::op_row(ui, "pr_op", operation);
         }
         Kind::Combine { operation, keep_tools } => {
             form_row(ui, "Operation", |ui| {

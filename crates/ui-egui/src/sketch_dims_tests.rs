@@ -298,6 +298,69 @@ fn rounded_rectangle_clicks_use_a_default_radius() {
     assert!((sketch.profiles[0].area - want).abs() < 0.05 * want, "area {} want about {want}", sketch.profiles[0].area);
 }
 
+/// "Dimension new shapes" (Preferences › Sketch) is off by default: shapes drawn by clicks get no
+/// dimensions. On, every size of the shape is dimensioned at its size as drawn, in the same undo
+/// step as the shape.
+#[test]
+fn dimension_new_shapes_dimensions_every_size_only_when_on() {
+    use solidcraft_engine::doc::expr::Kind;
+    let dimensions = |h: &Harness| -> Vec<f64> {
+        let doc = &h.app.session.doc;
+        let mut values: Vec<f64> = doc.params.iter().filter(|p| p.model).filter_map(|p| doc.eval(&p.name, Kind::Length).ok()).collect();
+        values.sort_by(f64::total_cmp);
+        values
+    };
+    let rectangle = |h: &mut Harness| {
+        h.step(&json!({"start": "sketch.rectangle.two_point"})).unwrap();
+        h.step(&json!({"click": {"sketch": [0, 0]}})).unwrap();
+        h.step(&json!({"click": {"sketch": [40, 20]}})).unwrap();
+    };
+
+    let mut h = Harness::new();
+    assert!(!h.app.preferences.sketch_auto_dimensions, "Dimension new shapes is on by default");
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    rectangle(&mut h);
+    assert!(dimensions(&h).is_empty(), "off, yet the rectangle has dimensions {:?}", dimensions(&h));
+
+    let mut h = Harness::new();
+    h.app.preferences.sketch_auto_dimensions = true;
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    rectangle(&mut h);
+    let sizes = dimensions(&h);
+    assert_eq!(sizes.len(), 2, "width and height: {sizes:?} {:?}", h.app.status);
+    assert!((sizes[0] - 20.0).abs() < 0.5 && (sizes[1] - 40.0).abs() < 0.5, "{sizes:?}");
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.step(&json!({"start": "sketch.circle.center"})).unwrap();
+    h.step(&json!({"click": {"sketch": [70, 10]}})).unwrap();
+    h.step(&json!({"click": {"sketch": [80, 10]}})).unwrap();
+    assert_eq!(dimensions(&h).len(), 3, "the circle's diameter joins: {:?} {:?}", dimensions(&h), h.app.status);
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(dimensions(&h).len(), 2, "one undo removes the circle with its dimension");
+}
+
+/// "Also place them from the origin" finishes the job: a rectangle drawn away from the origin
+/// gets its width, height and place, and the sketch is fully constrained. On its own (without
+/// "Dimension new shapes") it does nothing.
+#[test]
+fn place_from_the_origin_fully_constrains_new_shapes() {
+    let draw = |dimension: bool, locate: bool| -> (usize, u64) {
+        let mut h = Harness::new();
+        assert!(!h.app.preferences.sketch_auto_locate, "Also place them from the origin is on by default");
+        h.app.preferences.sketch_auto_dimensions = dimension;
+        h.app.preferences.sketch_auto_locate = locate;
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.step(&json!({"start": "sketch.rectangle.two_point"})).unwrap();
+        h.step(&json!({"click": {"sketch": [10, 10]}})).unwrap();
+        h.step(&json!({"click": {"sketch": [50, 30]}})).unwrap();
+        let dimensions = h.app.session.doc.params.iter().filter(|p| p.model).count();
+        let dof = h.app.run("sketch.solve", json!({})).unwrap()["dof"].as_u64().unwrap();
+        (dimensions, dof)
+    };
+    assert_eq!(draw(true, true), (4, 0), "width, height and two distances from the origin");
+    assert_eq!(draw(true, false), (2, 2), "sizes only: the rectangle can still move");
+    assert_eq!(draw(false, true), (0, 4), "placing needs Dimension new shapes");
+}
+
 /// A line from a circle's centre to the circle, ending a little off the quadrant: the preview
 /// snaps to horizontal or vertical, so the click must place exactly that line, on the circle.
 #[test]
@@ -453,4 +516,67 @@ fn value_boxes_stay_in_view_and_off_the_cursor() {
     // No room on either side: inside the view all the same.
     let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 30.0));
     assert!(tiny.contains_rect(egui::Rect::from_min_size(in_view(egui::pos2(-200.0, -200.0), Some(tiny), Some(egui::pos2(40.0, 15.0))), BOX)));
+}
+
+/// `name = expression` in a value box, as in the Dimension tool's: the shape takes the
+/// expression's size while it is typed and when placed, and the new parameter `name` drives its
+/// dimension (#7567).
+#[test]
+fn a_box_typed_name_equals_value_defines_the_parameter_driving_the_dimension() {
+    let mut h = drawing("sketch.circle.center");
+    type_value(&mut h, "width=20");
+    let tool = h.app.tool.as_ref().unwrap();
+    assert_eq!(crate::sketch_dims::locked_value(&h.app, tool, "Diameter"), Some(20.0), "the preview follows the typed size");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    let state = h.app.session.world_state();
+    let sk = &state.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
+    assert_eq!(sk.curves.len(), 1, "{:?}", h.app.status);
+    assert!(sk.radius(0).is_some_and(|r| (r - 10.0).abs() < 1e-6), "{:?}", sk.radius(0));
+    let width = h.app.session.doc.param("width").expect("the parameter is defined");
+    assert_eq!((width.expr.as_str(), width.unit.as_str(), width.model), ("20", "mm", false));
+    let dimension = sk.constraints.iter().find_map(|c| c.param.as_deref()).expect("a driving dimension");
+    assert_eq!(h.app.session.doc.param(dimension).unwrap().expr, "width");
+    assert_eq!(h.app.status.as_ref().map(|(text, _, error)| (text.as_str(), *error)), Some(("Parameter `width` defined", false)));
+
+    // In an inch design the right-hand side is in inches, while typing too.
+    let mut h = Harness::new();
+    h.app.run("document.units", json!({"units":"in"})).unwrap();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.step(&json!({"start":"sketch.rectangle.two_point"})).unwrap();
+    h.step(&json!({"click":{"world":[0,0,0]}})).unwrap();
+    h.step(&json!({"move":{"world":[25.4,12.7,0]}})).unwrap();
+    type_value(&mut h, "#w = 2");
+    tab(&mut h, false);
+    type_value(&mut h, "h = 1");
+    let tool = h.app.tool.as_ref().unwrap();
+    assert!((crate::sketch_dims::locked_value(&h.app, tool, "Width").unwrap() - 50.8).abs() < 1e-6);
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert_eq!(h.app.session.doc.param("w").map(|p| p.unit.as_str()), Some("in"), "{:?}", h.app.status);
+    assert!(h.app.session.doc.param("h").is_some());
+    assert_eq!(h.app.status.as_ref().map(|(text, _, _)| text.as_str()), Some("Parameters `h`, `w` defined"));
+}
+
+/// A box that is not a dimension (a polygon's sides, a rounded rectangle's corner radius) has
+/// nothing for a parameter to drive: `name = ...` there is refused, not quietly dropped.
+#[test]
+fn a_definition_in_a_box_that_is_not_a_dimension_is_refused() {
+    for (command, tabs, text, says) in [
+        ("sketch.polygon.inscribed", 1, "n = 6", "Sides: only a box that becomes a dimension can define `n`"),
+        ("sketch.rectangle.rounded", 2, "r = 2", "Radius: only a box that becomes a dimension can define `r`"),
+        ("sketch.circle.center", 0, "w =", "Diameter: `w =` needs a value after the `=`"),
+    ] {
+        let mut h = drawing(command);
+        for _ in 0..tabs {
+            tab(&mut h, false);
+        }
+        type_value(&mut h, text);
+        h.step(&json!({"key": "Enter"})).unwrap();
+        let state = h.app.session.world_state();
+        let sk = &state.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
+        assert!(sk.curves.is_empty(), "{command} {text}: placed {:?}", h.app.status);
+        assert!(h.app.session.doc.params.iter().all(|p| p.model), "{command} {text}: no user parameter");
+        let status = h.app.status.as_ref().expect("the refusal is reported");
+        assert!(status.2 && status.0.starts_with(says), "{command} {text}: {status:?}");
+        assert_eq!(h.app.tool.as_ref().unwrap().pts.len(), 1, "{command} {text}: the first point stays down");
+    }
 }

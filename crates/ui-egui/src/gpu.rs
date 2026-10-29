@@ -8,30 +8,68 @@ use std::sync::{Arc, Mutex};
 
 use egui_wgpu::wgpu;
 pub use solidcraft_gpu::view::{
-    AccessMap, BlockBuilder, BlockBytes, BlockTris, DrawStats, DrawStatsHandle, Frame, GpuImage, GpuScene, GpuTarget, INSTANCE_SIZE, InstanceLook,
-    InstancedMesh, LINE_SIZE, LOD_PX, MAX_PALETTE, PBR_SIZE, Palette, PaletteIndex, PlannedBody, Renderer, SHARED_SIZE, SceneBlock, SceneSlot,
-    SharedTris, TRI_SIZE, TriClass, extend_runs, level_for, lifted_width, placement_scale, runs_within, supersampled_size,
+    AccessMap, BlockBuilder, BlockBytes, BlockTris, CLOUD_POINT_SIZE, DrawStats, DrawStatsHandle, Frame, GpuImage, GpuPoints, GpuScene, GpuTarget,
+    INSTANCE_SIZE, InstanceLook, InstancedMesh, LINE_SIZE, LOD_PX, MAX_PALETTE, PBR_SIZE, Palette, PaletteIndex, PlannedBody, Renderer, SHARED_SIZE,
+    SceneBlock, SceneSlot, SharedTris, TRI_SIZE, TriClass, UploadError, cloud_point, extend_runs, level_for, lifted_width, placement_scale,
+    runs_within, supersampled_size,
 };
 
 /// A frame of the viewport as an egui paint callback.
 pub struct ViewportCallback(pub Frame);
 
+/// The GPU plan evaluation compiling beside the window: there once it is ready ([`tick_tessellation`]).
+pub type TessReady = std::sync::Arc<std::sync::OnceLock<solidcraft_gpu::TessGpu>>;
+
 /// Create the pipelines. Call once with the app's render state, the scene target's depth/stencil/
 /// MSAA settings, and the target of the pass the picture is shown in. Without a stencil the
 /// section cap does not hide the inside of cut bodies. Without `gpu_meshing` (safe mode) bodies
 /// are meshed on the CPU. When the two targets differ, the scene is drawn offscreen and blitted.
-/// Also returns the handle to what each frame drew.
-pub fn install(rs: &egui_wgpu::RenderState, scene: GpuTarget, window: GpuTarget, gpu_meshing: bool) -> (GpuTarget, DrawStatsHandle) {
+/// Also returns the handle to what each frame drew, and the GPU plan evaluation still compiling
+/// (native: the target says `tess: false` until it is ready).
+pub fn install(
+    rs: &egui_wgpu::RenderState,
+    scene: GpuTarget,
+    window: GpuTarget,
+    gpu_meshing: bool,
+) -> (GpuTarget, DrawStatsHandle, Option<TessReady>) {
     log_uncaptured_errors(&rs.device);
+    // The evaluation shader compiles beside the window, which does not wait for it: on D3D12 it
+    // takes seconds, most of the start (#4860). Bodies are built on the CPU until it is ready.
+    #[cfg(not(target_arch = "wasm32"))]
+    let later = gpu_meshing.then(|| solidcraft_gpu::view::TessLater::start(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER));
+    #[cfg(target_arch = "wasm32")]
     let tess = if gpu_meshing { solidcraft_gpu::view::tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER) } else { None };
-    let scene = GpuTarget { tess: tess.is_some(), ..scene };
-    let window = GpuTarget { tess: tess.is_some(), ..window };
-    let res = Renderer::with_window_target(&rs.device, scene, window, tess);
+    #[cfg(not(target_arch = "wasm32"))]
+    let tess = None;
+    let (scene, window) = (GpuTarget { tess: tess.is_some(), ..scene }, GpuTarget { tess: tess.is_some(), ..window });
+    #[allow(unused_mut)] // Only native hosts hand the renderer a later evaluation.
+    let mut res = Renderer::with_window_target(&rs.device, scene, window, tess);
+    #[cfg(not(target_arch = "wasm32"))]
+    let ready = later.map(|later| {
+        let ready = later.ready();
+        res.tessellate_later(later);
+        ready
+    });
+    #[cfg(target_arch = "wasm32")]
+    let ready = None;
     // What the renderer can do (order-independent transparency), not only what was asked for.
     let scene = res.target();
     let stats = res.stats();
     rs.renderer.write().callback_resources.insert(res);
-    (scene, stats)
+    (scene, stats, ready)
+}
+
+/// Draw bodies from their plans on the GPU from the frame the evaluation shader has compiled
+/// ([`install`]); until then, and where it never does, they are built on the CPU.
+pub(crate) fn tick_tessellation(app: &mut crate::SolveApp) {
+    if app.viewport.tess_ready.as_ref().is_some_and(|ready| ready.get().is_some()) {
+        app.viewport.tess_ready = None;
+        if let Some(gpu) = app.viewport.gpu.as_mut() {
+            gpu.tess = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("SolidCraft graphics: GPU tessellation ready; bodies are evaluated on the GPU from now on");
+        }
+    }
 }
 
 /// A GPU error no error scope caught is reported, never a panic: a device's default handler
@@ -172,13 +210,14 @@ pub fn analysis_colors(c: &crate::theme::AnalysisColors) -> [f32; 36] {
 pub(crate) fn offscreen_backends() -> wgpu::Backends {
     static CHOSEN: std::sync::OnceLock<wgpu::Backends> = std::sync::OnceLock::new();
     *CHOSEN.get_or_init(|| {
-        let default = wgpu::InstanceDescriptor::new_without_display_handle_from_env().backends;
+        let default = solidcraft_gpu::instance_descriptor_from_env().backends;
         if !cfg!(target_os = "windows") || std::env::var("WGPU_BACKEND").is_ok_and(|v| !v.trim().is_empty()) {
             return default;
         }
         let hardware = |backends: wgpu::Backends| {
             let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
             desc.backends = backends;
+            desc.backend_options.dx12.shader_compiler = solidcraft_gpu::dx12_compiler();
             let adapters = pollster::block_on(wgpu::Instance::new(desc).enumerate_adapters(backends));
             adapters.iter().any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
         };
@@ -194,7 +233,7 @@ pub(crate) fn offscreen_backends() -> wgpu::Backends {
 pub(crate) fn offscreen_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
     static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one_at_a_time = STARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let mut desc = solidcraft_gpu::instance_descriptor_from_env();
     desc.backends = offscreen_backends();
     let instance = wgpu::Instance::new(desc);
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
@@ -242,13 +281,23 @@ pub(crate) fn render_offscreen(
         back,
         eye,
         size,
-        Offscreen { tess, product: false, srgb: false, analysis, analysis_colors: colors, ssaa: 1.0, ao_radius: 0.0 },
+        Offscreen {
+            tess,
+            product: false,
+            srgb: false,
+            analysis,
+            analysis_colors: colors,
+            ssaa: 1.0,
+            ao_radius: 0.0,
+            ao_samples: solidcraft_gpu::view::AO_SAMPLES,
+        },
     )
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn render_product_offscreen(
     scene: GpuScene,
+    highlight: Option<GpuScene>,
     view_proj: [[f32; 4]; 4],
     back: [f32; 3],
     eye: [f32; 4],
@@ -257,12 +306,21 @@ pub(crate) fn render_product_offscreen(
 ) -> Option<Vec<u8>> {
     offscreen(
         scene,
-        None,
+        highlight,
         view_proj,
         back,
         eye,
         size,
-        Offscreen { tess: None, product: true, srgb, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa: 1.0, ao_radius: 0.0 },
+        Offscreen {
+            tess: None,
+            product: true,
+            srgb,
+            analysis: [0.0; 8],
+            analysis_colors: [0.0; 36],
+            ssaa: 1.0,
+            ao_radius: 0.0,
+            ao_samples: solidcraft_gpu::view::AO_SAMPLES,
+        },
     )
 }
 
@@ -275,6 +333,7 @@ struct Offscreen<'a> {
     analysis_colors: [f32; 36],
     ssaa: f32,
     ao_radius: f32,
+    ao_samples: u32,
 }
 
 /// [`render_offscreen`] of a scene supersampled `ssaa` times (1: off).
@@ -294,11 +353,21 @@ pub(crate) fn render_offscreen_ssaa(
         back,
         eye,
         size,
-        Offscreen { tess: None, product: false, srgb: false, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa, ao_radius: 0.0 },
+        Offscreen {
+            tess: None,
+            product: false,
+            srgb: false,
+            analysis: [0.0; 8],
+            analysis_colors: [0.0; 36],
+            ssaa,
+            ao_radius: 0.0,
+            ao_samples: solidcraft_gpu::view::AO_SAMPLES,
+        },
     )
 }
 
-/// [`render_offscreen`] of a scene with ambient occlusion of `ao_radius` (world units; 0: off).
+/// [`render_offscreen`] of a scene with ambient occlusion of `ao_radius` (world units; 0: off),
+/// `ao_samples` samples per pixel.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn render_offscreen_ao(
     scene: GpuScene,
@@ -307,6 +376,7 @@ pub(crate) fn render_offscreen_ao(
     eye: [f32; 4],
     size: u32,
     ao_radius: f32,
+    ao_samples: u32,
 ) -> Option<Vec<u8>> {
     offscreen(
         scene,
@@ -315,7 +385,7 @@ pub(crate) fn render_offscreen_ao(
         back,
         eye,
         size,
-        Offscreen { tess: None, product: false, srgb: false, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa: 1.0, ao_radius },
+        Offscreen { tess: None, product: false, srgb: false, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa: 1.0, ao_radius, ao_samples },
     )
 }
 
@@ -329,7 +399,7 @@ fn offscreen(
     size: u32,
     options: Offscreen<'_>,
 ) -> Option<Vec<u8>> {
-    let Offscreen { tess, product, srgb, analysis, analysis_colors, ssaa, ao_radius } = options;
+    let Offscreen { tess, product, srgb, analysis, analysis_colors, ssaa, ao_radius, ao_samples } = options;
     let (adapter, device, queue) = offscreen_device()?;
     eprintln!("offscreen adapter: {:?}", adapter.get_info().backend);
     let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
@@ -340,7 +410,9 @@ fn offscreen(
     resources.insert(Renderer::new(&device, target, compute));
     let none = || Arc::new(Mutex::new(None));
     let cb = ViewportCallback(Frame {
+        product_lights: None,
         product,
+        upload_error: None,
         key: 1,
         slot: Arc::new(Mutex::new(Some(scene))),
         sketch_key: 0,
@@ -356,12 +428,14 @@ fn offscreen(
         clip: [0.0; 4],
         cap: [0.0; 4],
         images: Vec::new(),
+        points: Vec::new(),
         analysis,
         analysis_colors,
         access: None,
         outline: false,
         eye,
         ao_radius,
+        ao_samples,
         ssaa,
         hover_tint: [0.0; 3],
         selection_tint: [0.0; 3],
@@ -532,6 +606,28 @@ impl OffscreenFrames {
 
 #[cfg(test)]
 mod tests {
+    /// Bodies are drawn from their plans on the GPU from the frame the evaluation shader has
+    /// compiled, and built on the CPU until then (#4860).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plans_are_drawn_on_the_gpu_once_the_evaluation_has_compiled() {
+        let Ok(tess) = solidcraft_gpu::TessGpu::headless() else {
+            eprintln!("skipped: no GPU adapter that builds the evaluation");
+            return;
+        };
+        let mut app = crate::SolveApp::new(Default::default(), Default::default());
+        app.viewport.gpu =
+            Some(super::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
+        let ready = super::TessReady::default();
+        app.viewport.tess_ready = Some(ready.clone());
+        super::tick_tessellation(&mut app);
+        assert!(app.viewport.gpu.is_some_and(|g| !g.tess), "still compiling: built on the CPU");
+        assert!(ready.set(tess).is_ok());
+        super::tick_tessellation(&mut app);
+        assert!(app.viewport.gpu.is_some_and(|g| g.tess), "compiled: drawn from plans");
+        assert!(app.viewport.tess_ready.is_none());
+    }
+
     /// The offscreen tests start the backends the app would: on Windows without `WGPU_BACKEND`
     /// exactly one, from the app's order (D3D12, Vulkan, OpenGL); otherwise wgpu's default.
     #[cfg(not(target_arch = "wasm32"))]

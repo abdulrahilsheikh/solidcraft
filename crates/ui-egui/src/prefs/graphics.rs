@@ -163,8 +163,10 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     ui_kit::checkbox(ui, app.tr("ui.frame_rate_details"), &mut app.preferences.frame_rate_details)
                         .on_hover_text(app.tr("settings.frame_rate_details_note"));
                 });
+                crate::prefs::view_angles_checkbox(app, left);
                 setting::reference_geometry_through_bodies(app, left).on_hover_text(app.tr("settings.reference_geometry_through_bodies_help"));
                 setting::sketch_halo(app, left);
+                setting::vertex_markers(app, left);
             }
             if let Some(right) = columns.get_mut(1) {
                 ui_kit::checkbox(right, crate::i18n::tr_label("Ground shadow"), &mut app.ui.ground_shadow);
@@ -186,6 +188,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     });
     #[cfg(target_os = "linux")]
     ui_kit::settings_section(ui, "window_system", app.tr("ui.window_system"), |ui| window_system_row(app, ui));
+    setting::render_previous_geometry_budget(app, ui).on_hover_text(app.tr("prefs.render_previous_geometry_budget_help"));
     ui.horizontal(|ui| {
         ui_kit::text(ui, app.tr_label("Renderer"), ui_kit::Text::Inline);
         let renderer = match (&app.viewport.gpu, &app.help.gpu) {

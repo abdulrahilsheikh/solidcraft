@@ -25,6 +25,7 @@ pub mod params;
 pub mod product_scene;
 pub mod recovery;
 pub mod render_jobs;
+pub mod render_lights;
 pub mod sample;
 pub mod schema;
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,7 +43,10 @@ use serde_json::Value;
 use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
-pub use cmd::{CommandInfo, CommandSpec, auto_operation, command_specs, extrude_reach, find_command, resolve_design_links, standard_view};
+pub use cmd::{
+    Addition, CommandInfo, CommandSpec, addition, auto_operation, command_specs, dimension_roles, extrude_reach, find_command, resolve_design_links,
+    shown_scope, standard_view,
+};
 pub use solidcraft_doc as doc;
 pub use solidcraft_doc::Visibility;
 pub use solidcraft_geom as geom;
@@ -386,6 +390,7 @@ pub struct Session {
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
     occurrence_bodies_cache: std::sync::Mutex<Option<occurrences::OccurrenceBodiesCache>>,
+    placement_index_cache: std::sync::Mutex<Option<occurrences::PlacementIndex>>,
     /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
     /// scratch copies): a body that did not change or move is not measured again.
     clearance_cache: std::sync::Arc<std::sync::Mutex<cmd::clearance::PairCache>>,
@@ -399,6 +404,8 @@ pub struct Session {
     pub clipboard: Vec<solidcraft_doc::Feature>,
     /// Sketch geometry copied with `sketch.copy` (pasted by `sketch.paste`).
     pub sketch_clipboard: Option<cmd::sketch_clipboard::SketchClip>,
+    /// Resolved appearance copied by appearance.copy; transient, outside design/history.
+    pub appearance_clipboard: Option<solidcraft_doc::appearance::Look>,
     /// Section Analysis: a view cut by a plane (origin, unit normal; the normal side is hidden).
     pub section: Option<(Vec3, Vec3)>,
     /// Whether the section's cut faces are hatched (`inspect.section`'s `hatch`; on by default).
@@ -541,7 +548,7 @@ impl Session {
             .and_then(|saved| Model::adopt(&doc, saved).map_err(|e| log::info!("the saved model is not used: {e}")).ok());
         let model = adopted.unwrap_or_else(|| {
             let mut model = Model::new();
-            model.evaluate(&doc);
+            model.evaluate_shared(&doc);
             model
         });
         Session {
@@ -575,11 +582,13 @@ impl Session {
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
+            placement_index_cache: Default::default(),
             clearance_cache: Default::default(),
             body_renames: Vec::new(),
             contact_meshes: Default::default(),
             clipboard: Vec::new(),
             sketch_clipboard: None,
+            appearance_clipboard: None,
             section: None,
             section_hatch: true,
             colored_components: None,
@@ -637,6 +646,19 @@ impl Session {
     pub fn mark_saved(&mut self) {
         self.saved = self.doc.clone();
         self.saved_visibility = self.visibility.clone();
+    }
+
+    /// The name Save As offers for the design's file, without its extension: the name of the
+    /// file it was opened from or last saved to, unless the design has been renamed since, and
+    /// the design's own name otherwise. The name stored in a file need not be the file's: a
+    /// design named `Plate` saved as `Plate-a.sc` and copied to `Plate-b.sc` is `Plate` in both,
+    /// and offering `Plate.sc` for each invites replacing one file with the other (#8329).
+    pub fn save_as_name(&self) -> String {
+        let stem = self.path.as_deref().and_then(|p| std::path::Path::new(p).file_stem()).map(|s| s.to_string_lossy().trim().to_string());
+        match stem {
+            Some(stem) if !stem.is_empty() && self.doc.name == self.saved.name => stem,
+            _ => self.doc.name.clone(),
+        }
     }
 
     pub fn render_backend(&self) -> render::BackendDescriptor {
@@ -721,6 +743,12 @@ impl Session {
 
     /// Mutable document (copy-on-write).
     pub fn doc_mut(&mut self) -> &mut Document {
+        // The placement index keeps the document alive with its answers; let it go before an
+        // in-place edit, so the edit stays in place (a shared handle would clone the document
+        // to a new address behind the crash journal's back, #7502) and no stale lookup outlives it.
+        if let Ok(mut index) = self.placement_index_cache.lock() {
+            *index = None;
+        }
         Arc::make_mut(&mut self.doc)
     }
 
@@ -822,16 +850,31 @@ impl Session {
     }
 
     pub fn refresh(&mut self) {
-        self.model.evaluate(&self.doc);
-        #[cfg(test)]
-        {
-            self.evaluations += 1;
+        if self.model.evaluate_shared(&self.doc) {
+            #[cfg(test)]
+            {
+                self.evaluations += 1;
+            }
         }
         self.revision += 1;
         self.prune_occurrence_state();
         // Joints follow the geometry their origins snap to.
         if !self.doc.assembly.joints.is_empty() {
-            self.solve_joints();
+            // A solve that moves parts changes what features reading where a part is placed
+            // (a mirror of a placed body) make: the model is evaluated again for the placements
+            // the design now holds, and the joints solved for that model, a few times at most.
+            for _ in 0..3 {
+                let before = self.doc.clone();
+                self.solve_joints();
+                if Arc::ptr_eq(&before, &self.doc) || before.occurrences == self.doc.occurrences {
+                    break;
+                }
+                self.model.evaluate(&self.doc);
+                #[cfg(test)]
+                {
+                    self.evaluations += 1;
+                }
+            }
         }
         cmd::motion::associative::refresh(self);
         if let Some(id) = self.active_sketch
@@ -926,7 +969,7 @@ impl Session {
         }
         doc.reserved_body_names.extend(reserve);
         // The pinned names are the ones the bodies have: no result changes, so none is evaluated.
-        self.model.refingerprint(&self.doc);
+        self.model.refingerprint_shared(&self.doc);
     }
 
     /// A hidden construction plane stays hidden when the design renames it, or undo or redo
@@ -1031,6 +1074,7 @@ impl Session {
     /// Show the sketch a live frame changed, leaving the features after it as they were last
     /// evaluated (marked stale); a full `refresh` when the model cannot show it that way.
     fn refresh_live(&mut self, edit: LiveEdit) {
+        // design-only: a live drag shows the design's sketch in the model.
         let sketch = self.doc.sketch(edit.sketch).ok().cloned();
         if sketch.is_some_and(|sketch| self.model.show_live_sketch(edit.sketch, sketch, edit.report)) {
             self.revision += 1;
@@ -1079,6 +1123,7 @@ impl Session {
             }
         }
         for (id, sketch) in updated {
+            // design-only: a parameter edit rewrites the design's pattern-quantity sketches.
             *self.doc_mut().sketch_mut(id)? = sketch;
         }
         self.refresh();
@@ -1091,6 +1136,9 @@ impl Session {
         }
         // Checked first: storing makes the document unique (a copy when the undo step shares it).
         if self.model.edited_sketches(&self.doc).next().is_some() {
+            if let Ok(mut index) = self.placement_index_cache.lock() {
+                *index = None;
+            }
             self.model.adopt_solved_sketches(Arc::make_mut(&mut self.doc));
         }
         Ok(())
@@ -1134,7 +1182,12 @@ impl Session {
         // Picks in the world go into their component's frame (once: commands run by commands
         // already have them there).
         let (_nested, outermost) = frames::Nested::enter(spec.id);
-        let mapped = if outermost { frames::to_local(self, spec.id, params) } else { None };
+        let mapped = if outermost {
+            frames::forget_picks();
+            frames::to_local(self, spec.id, params)
+        } else {
+            None
+        };
         let params = mapped.as_ref().unwrap_or(params);
         if outermost {
             crash::command_begin(self, spec.id, given);
@@ -1152,6 +1205,19 @@ impl Session {
                 Err(EngineError::Internal(spec.id.to_string(), msg))
             }
         };
+        // A value typed as `name = expression` defines the user parameter `name` (#4071), in the
+        // same undo step; a refused definition fails the command, which leaves the design as it was.
+        let r = match r {
+            Ok((v, live_edit)) if params::has_definition(params) => self.define_inline(spec.id, v).map(|v| (v, live_edit)),
+            r => r,
+        };
+        // A parameter error that did not name the command names it here: the engine knows which
+        // command ran, and the reader of the parameters may not (#6651).
+        let r = match r {
+            Ok(r) => Ok(r),
+            Err(EngineError::BadParams { cmd, msg }) if cmd.is_empty() => Err(EngineError::BadParams { cmd: spec.id.to_string(), msg }),
+            Err(e) => Err(e),
+        };
         // New/open/recover can replace the Session. Device ownership belongs to the host,
         // so its capability metadata survives those document lifecycle commands.
         self.render_viewport = host_viewport;
@@ -1161,10 +1227,8 @@ impl Session {
         for (host, _) in additional_jobs {
             self.register_render_job_host(host)?;
         }
-        if outermost && crash::enabled() {
-            // A failed command leaves the design as it was (restored below).
+        let crash_outcome = if outermost && crash::enabled() {
             let failed = r.as_ref().err().map(ToString::to_string);
-            let after = if failed.is_some() { &before.doc } else { &self.doc };
             // Commands that only read leave no trace (the journal keeps what a replay needs).
             let changed = !Arc::ptr_eq(&self.doc, &before.doc)
                 || self.active_sketch != before.active_sketch
@@ -1172,13 +1236,15 @@ impl Session {
                 || self.active_component != active_before.0
                 || self.active_occurrence_path != active_before.1
                 || spec.id.starts_with("select.");
-            crash::command_done(self.crash_journal, changed, &before.doc, after, spec.id, given, failed.map_or(Ok(()), Err));
-        }
+            Some((before.doc.clone(), changed, failed))
+        } else {
+            None
+        };
         let changed = !Arc::ptr_eq(&self.doc, &before.doc);
         // Hiding or showing (`browser.visibility`) leaves the document alone, so it needs its own
         // test: it is saved with the design and has an undo step of its own.
         let hidden = self.visibility != before.visibility;
-        match r {
+        let result = match r {
             Ok((v, live_edit)) => {
                 let v = if changed { self.with_created(spec.id, params, &before, v) } else { v };
                 if changed || hidden {
@@ -1222,7 +1288,28 @@ impl Session {
                 }
                 Err(e)
             }
+        };
+        if let Some((before, changed, failed)) = crash_outcome {
+            // Refresh and body-name pinning can copy the shared document. Remember the final
+            // document, so the next command does not mistake that work for an outside edit
+            // and discard the replay. Failed commands have restored their document by now.
+            crash::command_done(self.crash_journal, changed, &before, &self.doc, spec.id, given, failed.map_or(Ok(()), Err));
         }
+        result
+    }
+
+    /// Store the definitions a command left in the design (`Document::define_inline`): its
+    /// result names them, `defined` the first (as `sketch.dimension` does) and `definitions` all.
+    fn define_inline(&mut self, id: &str, mut v: Value) -> Result<Value> {
+        let mut doc = (*self.doc).clone();
+        let defined = doc.define_inline().map_err(|e| EngineError::BadParams { cmd: id.to_string(), msg: e.to_string() })?;
+        let Some(first) = defined.first() else { return Ok(v) };
+        if let Some(out) = v.as_object_mut() {
+            out.insert("defined".into(), serde_json::json!(first.name));
+            out.insert("definitions".into(), serde_json::json!(defined));
+        }
+        self.doc = Arc::new(doc);
+        Ok(v)
     }
 
     /// A sketch command's result gets `created`: the ids of the points, curves, constraints and
@@ -1241,6 +1328,7 @@ impl Session {
             _ => None,
         };
         let Some(sk) = named.or(self.active_sketch).or(before.active_sketch) else { return v };
+        // design-only: a command's `created` compares two snapshots of the design.
         let Ok(after) = self.doc.sketch(sk) else { return v };
         out.insert("created".into(), cmd::sketch_created(before.doc.sketch(sk).ok(), after));
         v
@@ -1335,11 +1423,13 @@ impl Session {
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
+            placement_index_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
             body_renames: self.body_renames.clone(),
             contact_meshes: self.contact_meshes.clone(),
             clipboard: self.clipboard.clone(),
             sketch_clipboard: self.sketch_clipboard.clone(),
+            appearance_clipboard: self.appearance_clipboard.clone(),
             section: None,
             section_hatch: true,
             colored_components: None,
@@ -1421,6 +1511,8 @@ impl Session {
                 || id.starts_with("select.");
             steps.push(ComputedCommand { id: id.clone(), params: params.clone(), before, after: computed.doc.clone(), changed, reply });
         }
+        // What the source was primed with stays out of the session that is adopted (#6901).
+        computed.unprime();
         Ok(ComputedCommands { source: self, computed, steps })
     }
 
@@ -1777,6 +1869,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         configs,
         favorites,
         canvases,
+        point_clouds,
         param_comments,
         materials,
         user_materials,
@@ -1811,6 +1904,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *configs == b.configs
         && *favorites == b.favorites
         && *canvases == b.canvases
+        && *point_clouds == b.point_clouds
         && *param_comments == b.param_comments
         && *materials == b.materials
         && *user_materials == b.user_materials

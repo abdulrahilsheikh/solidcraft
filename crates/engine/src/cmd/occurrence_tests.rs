@@ -1383,3 +1383,127 @@ fn a_body_seen_in_another_placement_copies_from_there() {
     let state = s.model.state();
     assert_eq!(s.doc.model_body_component(state.body("Cube (2)").unwrap()), 0);
 }
+
+/// A nested assembly's body listing, and the indexed placement agreeing with the plain walk
+/// (#7502: listing a subtree must cost the subtree, not the subtree times the design).
+#[test]
+fn occurrence_bodies_lists_a_nested_assembly() {
+    let mut s = Session::default();
+    let (_outer, outer) = created(&mut s, "Outer");
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Shell"}));
+    let (_middle, middle) = created(&mut s, "Middle");
+    run(&mut s, "solid.box", json!({"length": 2, "width": 2, "height": 2, "body_name": "Plate"}));
+    let (_inner, inner) = created(&mut s, "Inner");
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Pin"}));
+    let deep = [outer, middle, inner];
+    let sorted = |v: Vec<String>| {
+        let mut v = v;
+        v.sort();
+        v
+    };
+    assert_eq!(sorted(s.occurrence_bodies(&deep, true).unwrap()), ["Pin"]);
+    assert_eq!(sorted(s.occurrence_bodies(&[outer, middle], true).unwrap()), ["Pin", "Plate"]);
+    assert_eq!(sorted(s.occurrence_bodies(&[outer], true).unwrap()), ["Pin", "Plate", "Shell"]);
+    assert_eq!(sorted(s.occurrence_bodies(&[outer, middle], false).unwrap()), ["Plate"]);
+    // The indexed placement answers exactly what the plain walk does.
+    for path in [&deep[..], &[outer, middle][..], &[outer][..]] {
+        let (indexed, walked) = (s.occurrence_placement(path).unwrap(), s.occurrence_placement_walk(path).unwrap());
+        assert_eq!(indexed.component, walked.component);
+        assert_eq!(indexed.name, walked.name);
+        assert_eq!(indexed.world, walked.world);
+        assert_eq!(indexed.bodies.len(), walked.bodies.len());
+        for (a, b) in indexed.bodies.iter().zip(&walked.bodies) {
+            assert_eq!((a.source.as_str(), a.world.as_str()), (b.source.as_str(), b.world.as_str()));
+        }
+    }
+}
+
+/// A burst of other paths retires single remembered answers instead of clearing the whole
+/// cache, so the active occurrence's listing survives and needn't re-expand (#7502).
+#[test]
+fn occurrence_bodies_cache_retires_one_answer_when_full() {
+    let mut s = Session::default();
+    let (_assembly, assembly) = created(&mut s, "Assembly");
+    let (part, _) = created(&mut s, "Part");
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Part"}));
+    let mut copies = Vec::new();
+    for i in 0..130 {
+        let o = run(&mut s, "occurrence.copy", json!({"component": part, "translate": [i as f64 * 10.0, 0.0, 0.0]}))["occurrence"].as_u64().unwrap();
+        copies.push(o);
+    }
+    // The active listing (the whole assembly) is asked first and remembered.
+    let root = vec![assembly];
+    assert_eq!(s.occurrence_bodies(&root, true).unwrap().len(), 131);
+    // Then a burst of per-copy queries: 260 more keys, over the cache's 256-entry limit.
+    for o in &copies {
+        let path = vec![assembly, *o];
+        assert_eq!(s.occurrence_bodies(&path, false).unwrap().len(), 1);
+        assert_eq!(s.occurrence_bodies(&path, true).unwrap().len(), 1);
+    }
+    let guard = s.occurrence_bodies_cache.lock().unwrap();
+    let cache = guard.as_ref().unwrap();
+    assert!(cache.bodies.contains_key(&(root.clone(), true)), "the active listing survives a burst of other paths");
+    assert!(cache.bodies.len() <= 256, "the cache stays bounded at its limit");
+    drop(guard);
+    assert_eq!(s.occurrence_bodies(&root, true).unwrap().len(), 131);
+}
+
+/// A connector's boss extruded To Object up to the shell of another component joins the
+/// connector only: the shell it runs to stays its own body in its own component, and the PCB
+/// sketched on the shell afterwards is still made (a Join extrude to an object joined the body
+/// it ran to across components, 0.24.1).
+#[test]
+fn join_extrude_to_a_body_of_another_component_leaves_that_body_alone() {
+    let mut s = Session::default();
+    let (shell, _) = created(&mut s, "Shell");
+    run(&mut s, "solid.box", json!({"corner":[-20,-20,20],"length":40,"width":40,"height":5,"body_name":"Shell"}));
+    let (connector, _) = created(&mut s, "Connector");
+    run(&mut s, "solid.cylinder", json!({"radius":6,"height":10,"body_name":"Connector"}));
+    let sketch = run(&mut s, "sketch.create", json!({"plane":{"face":[0,0,10]},"project_edges":false}))["sketch"].as_u64().unwrap();
+    let plane = s.model.state().sketch(sketch).unwrap().plane;
+    let centre = plane.to_local(solidcraft_geom::Vec3::new(0.0, 0.0, 10.0));
+    run(&mut s, "sketch.circle.center", json!({"center":[centre.x, centre.y],"radius":4}));
+    run(&mut s, "sketch.finish", json!({}));
+    // The boss runs up to the shell's underside and joins the connector it was sketched on.
+    run(&mut s, "solid.extrude", json!({"sketch":sketch,"to":[0,0,20],"operation":"join","targets":["Connector"]}));
+    let (pcb, _) = created(&mut s, "PCB");
+    run(&mut s, "solid.box", json!({"corner":[-15,-15,25],"length":30,"width":30,"height":1.6,"body_name":"PCB"}));
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+    let st = s.model.state();
+    let mut names: Vec<&str> = st.bodies.iter().map(|b| b.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Connector", "PCB", "Shell"], "three bodies, none merged into another");
+    for (name, component) in [("Shell", shell), ("Connector", connector), ("PCB", pcb)] {
+        assert_eq!(s.doc.model_body_component(st.body(name).unwrap()), component, "{name} stays in its component");
+    }
+    let volume = |name: &str| solidcraft_kernel::measure(&st.body(name).unwrap().body).unwrap().volume;
+    let pi = std::f64::consts::PI;
+    assert!((volume("Shell") - 8000.0).abs() < 1e-3, "the shell is unchanged: {}", volume("Shell"));
+    assert!((volume("Connector") - (pi * 36.0 * 10.0 + pi * 16.0 * 10.0)).abs() < 1.0, "the connector took the boss: {}", volume("Connector"));
+}
+
+/// A pattern of bodies made in a component copies them about its own component's axis, so
+/// moving that component's occurrence moves the copies of a body that lives elsewhere. The model
+/// kept between edits must show them where a fresh evaluation does: a root block patterned four
+/// times about the Z axis of component Part, then Part moved.
+#[test]
+fn a_pattern_of_another_components_body_follows_its_own_component_when_moved() {
+    let boxes = |st: &solidcraft_doc::ModelState| -> Vec<String> {
+        st.bodies
+            .iter()
+            .map(|b| {
+                let bb = b.body.outline_bounds();
+                format!("{} [{:.6} {:.6} {:.6}]..[{:.6} {:.6} {:.6}]", b.name, bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z)
+            })
+            .collect()
+    };
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [-4, -27, 0], "length": 20, "width": 13, "height": 4}));
+    created(&mut s, "Part");
+    run(&mut s, "solid.pattern.circular", json!({"axis": "Z", "bodies": ["Body1"], "count": 4}));
+    run(&mut s, "occurrence.move", json!({"occurrence": "Part:1", "translate": [6, -14, -3]}));
+    let mut fresh = solidcraft_doc::Model::new();
+    fresh.no_cache = true;
+    fresh.evaluate(&s.doc);
+    assert_eq!(boxes(&s.model.state()), boxes(&fresh.state()), "the kept model against a fresh evaluation");
+}

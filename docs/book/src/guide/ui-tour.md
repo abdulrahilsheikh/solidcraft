@@ -14,12 +14,22 @@
   panel's name for all its commands. Drag a command from the dropdown onto a panel's label
   or empty space to append it; the insertion line shows its destination. Drop onto an existing
   button to insert before it. Buttons can also move between panels, and the layout is saved.
+  Click the **+** after the tabs, right-click a tab or empty toolbar space, or use
+  **Preferences > Interface > Toolbar tabs** to hide or restore tabs. Every existing tab,
+  including Sheet Metal and Weldments, stays visible by default. Tabs you hide stay hidden in every
+  design until you show them again. Hidden tabs keep
+  their customised buttons, commands in search and shortcuts; with all tabs hidden, **+** remains.
 - **Browser** (left). The design as a tree: document settings and units, named views, the
   origin, bodies, sketches, construction planes, canvases, joints and components. The eye shows or
   hides an item, a component's radio button makes it the active component, and right-clicking any
   row gives that item's menu. Right-click the design or a component and choose **Expand All** or
   **Collapse All** to open or close every folder under that row (the design row stays visible
-  when the whole tree is collapsed). Rows drag into groups and other components.
+  when the whole tree is collapsed). Rows drag into groups and other components. **Preferences ›
+  Interface › Bodies folders** sets when a component's bodies sit in a Bodies folder of their own:
+  **Several bodies only** (the default) lists a component's body straight under it when it has
+  only one and no groups, **Never** lists every component's bodies and groups straight under it
+  (the folder's menu items are then on the component's menu), and **Always** keeps the folder.
+  The design's own Bodies folder, and a folder hidden with its eye, always stay.
 - **Viewport.** Click to select, Shift or Ctrl to add (Preferences › Selection), drag for a window or crossing box. While sketching, Ctrl/Cmd or Alt/Option suppress auto-snap by default; Shift prefers a midpoint; the pointer also snaps to where two curves cross. To
   reach something under something else (two lines drawn on top of each other, coincident points,
   an edge in front of a face, overlapping bodies), hold the left button still for half a second
@@ -29,9 +39,11 @@
   Esc or a click elsewhere closes the list. Clicking again on the same spot, with nothing changed
   in between, selects the next thing in that list. The
   wheel zooms at the cursor, the middle button pans and right-drag orbits freely (the mouse
-  preset in Preferences switches to SolidWorks, Inventor, Alias, Blender, Tinkercad, OpenSCAD or Touchpad style). On a
+  preset in Preferences switches to SolidWorks, Inventor, Alias, Maya, Blender, Tinkercad, OpenSCAD, HFSS or Touchpad style). On a
   trackpad, pinch zooms and two-finger scroll pans (Navigation › Two-finger scroll pans;
   off: scroll zooms like the wheel); mouse wheels zoom and the thumb wheel pans sideways.
+  On Linux, pinch needs the native Wayland window system
+  (see [Troubleshooting](troubleshooting.md)).
   With the **Fusion** preset and two-finger pan enabled, hold **Shift** while scrolling with
   two fingers to orbit freely instead of panning. No click is needed. Releasing Shift returns
   to panning, even during the same gesture. Shift does not snap this gesture to standard views;
@@ -44,9 +56,16 @@
   Enable **Preferences → Navigation → Free orbit** to rotate the mouse and 3D mouse continuously
   through both poles, preserving roll. During an orbit drag, Shift snaps the view direction and
   the picture rotation to the nearest quarter turn; releasing Shift resumes the unsnapped rotation.
-  Free orbit defaults to off for every mouse
+  Under it, **Turn around the vertical axis** makes sideways mouse drags spin the model around the
+  world's vertical axis instead of the screen's, while up and down drags still tilt over the top
+  without a limit. Both default to off for every mouse
   preset. With SolidWorks navigation, right-click a planar face and choose **Normal to Selection**
   to use Look At (also Ctrl+8); repeat to flip the side, preserving scale and projection.
+
+  **Right drag orbits** (Preferences › Navigation, on by default) is shown where the mouse
+  preset orbits on a right drag. Off, a right drag leaves the camera alone and the right button
+  only opens the context menu. Picking the SolidWorks preset turns it off and sets Middle
+  double-click to Fit; both can be changed back afterwards.
 
   **Mouse gestures** (Preferences › Navigation, off by default) work with the SolidWorks mouse preset
   only (the wheel orbits, Ctrl + wheel pans) and take over the right button, which then no longer
@@ -73,6 +92,13 @@
   top right while a dialog or a sketch is open, and moves the axis view or cube down below them.
   With a dialog open they do what its OK and Cancel do (the check is grey whenever OK is); in a
   sketch without a dialog they are Finish Sketch and Cancel Sketch.
+  **View angles** in the navigation bar's View menu (or Preferences › Graphics, or the
+  `view.angle_readout` command) shows the view's pitch, yaw and roll in degrees under the axis
+  view, with **Ortho** or **Persp** for the projection; it is off by default and updates as the
+  view turns. The angles turn about the up axis: yaw 0° is the Front view, 90° Left, −90° Right
+  and 180° Back; pitch 90° is the Top view and −90° the Bottom; a positive roll turns the model
+  clockwise on screen. Click the readout to type exact angles; **Apply** turns the view there
+  (it keeps the view's centre and zoom). Scripts set the same angles in radians with `view.apply`.
   Right-click for the marking menu: eight commands around the cursor, plus a
   menu for whatever is under it. Near the window's bottom or right edge a menu opens above or
   to the left of the cursor, so it stays in view.
@@ -82,20 +108,42 @@
   identity or change the exported solid. Unsupported or uncertain wall geometry
   keeps its existing edge presentation.
 - **Dialogs** dock on the right with a live preview. Most features also show drag handles and a
-  value box in the viewport. Interface › **Dialog buttons** › **Top** puts OK, Cancel and Apply in
+  value box in the viewport. Preferences › Interface › **Dialogs** › *In the left column* opens
+  them in the browser's place instead (and the History's, when it is at the left), at least as
+  wide as that column; the column comes back as it was when the dialog closes.
+  Interface › **Dialog buttons** › **Top** puts OK, Cancel and Apply in
   the dialog's title row, right of the title, where they stay while sections open and close;
   Cancel then also takes the place of the close button. Enter and Esc work as before.
 - **Timeline** (bottom). Every feature in order. Double-click to edit, drag the marker to roll
-  back, and drag features to reorder them. Preferences can put the timeline vertically at the
+  back, and drag features to reorder them. A sketch's icon, here and in the browser, takes the
+  colour of its state: the sketch colour while it is under constrained, the fully constrained
+  colour, or red while its constraints conflict; its tooltip names the state (Preferences ›
+  Sketch › **Sketch icons in the colour of their state**, on by default, turns this off).
+  Preferences can put the timeline vertically at the
   far left of the viewport, beside the browser. Its seam handle switches between icon
   chips and compact feature names; the browser can collapse to a rail beside either width.
-  Previous, Play and Next sit at the top. Double-click Previous to roll to the start.
+  Docked under the browser, the two share the column: drag the seam between them to give either
+  more height, and the split is remembered.
+  Its controls jump to the beginning, step back one feature, play, step forward one feature or
+  jump to the end. **Play History**, in the middle of those controls and under
+  **Inspect → History**, advances through the remaining features, pausing half a second after
+  each rebuilt step appears. It becomes **Stop History** while running; it is also in command
+  search and can be assigned a shortcut in Preferences → Keyboard Shortcuts. Click Stop History
+  or press Escape to stop playback; navigation and editing stop it too. To keep the controls to
+  four, right-click them and choose **Hide Play Button**, or clear the setting under
+  Preferences → Interface.
   Interface › **Sketches** › **Under their feature** lists a sketch in the vertical timeline one
   level in, under the first feature built from it, behind that feature's fold arrow. Dragging the
   feature takes its sketch along. A later feature built from the same sketch gets a row that
   selects it, and while the marker sits between a sketch and its feature, or the two are in
   different folders, the sketch keeps a row of its own. The timeline along the bottom always lists
   features in creation order.
+- **Status bar** (off by default: Preferences › Interface › **Status bar**). A thin bar along
+  the window's bottom edge, below the timeline. From the right: the design's units (click them
+  to change the design's units, one undo step), the open sketch's state in its colour (under
+  constrained with its degrees of freedom, fully constrained, constraints conflict) and what is
+  being edited (Editing Sketch1, or Editing Extrude1 while that feature's dialog is open). While
+  it is on, the sketch's state no longer shows in the view's top-left corner.
 - **Command search (S).** Click the ribbon search field or press S to open the search popup
   below it. Results group commands by their ribbon path and show matching features and user
   parameters from this design. With an empty query, recent commands appear first, followed by
@@ -138,12 +186,14 @@ History at the bottom is unchanged.
 ### Colour themes
 
 Interface › **Theme** lists Dark, Light and System (follows the operating system), the built-in
-themes and any themes you have imported. A choice applies at once. Under the themes, **Viewport** draws the 3D view in the Light or Dark theme's colours whatever the window uses, for example the model on a light view in a dark window (**Follow theme**, the default, keeps the theme's own). The built-in themes are Gruvbox
+themes and any themes you have imported. A choice applies at once. Under the themes, **Viewport** draws the 3D view in the Light or Dark theme's colours whatever the window uses, for example the model on a light view in a dark window (**Follow theme**, the default, keeps the theme's own). **Logo** draws the SolidCraft logo at the top left in shades of the theme's accent instead of the theme's logo colours. The built-in themes are Gruvbox
 (dark and light, each in hard, normal and soft contrast), SolidCraft 95, Platinum 9, Cupertino,
 Green Phosphor, Amber Phosphor, Blueprint, One Dark, Tokyo Night, Solarized Light, Nord, High
-Contrast, Graphite, Nosferatu, Catppuccin Mocha, and Okibi and Akari (dark and light, from the
-[Okibi design system](https://kaievns.github.io/okibi-akiri-design-system-spec/)), and Clay and
-Clay Dark (warm ivory paper and warm charcoal, with a terracotta accent and rounded corners).
+Contrast, Graphite, Nosferatu, Catppuccin Mocha, Okibi and Akari (dark and light, from the
+[Okibi design system](https://kaievns.github.io/okibi-akiri-design-system-spec/)), Clay and
+Clay Dark (warm ivory paper and warm charcoal, with a terracotta accent and rounded corners), and
+1-bit and 1-bit Dark (pure black and white with square corners: black on white, or white on
+black, with selections drawn inverted).
 
 A theme is a small JSON file that starts from the Dark or Light palette and changes any of its
 colours and corner radii by name:
@@ -186,7 +236,7 @@ respectively. The first four style small accents through large surfaces; `contro
 styles form controls, and `sketch_mode_radius` styles sketch creation buttons. Themes own
 these settings, with matching shapes across light and dark variants. Dock joins remain
 square, circular controls remain circular, and control sizes and spacing stay the same.
-Platinum 9 and the phosphor themes use square corners, SolidCraft 95 uses subtle 3-point
+Platinum 9, 1-bit, 1-bit Dark, and the phosphor themes use square corners, SolidCraft 95 uses subtle 3-point
 corners, Blueprint uses the standard radii, Cupertino uses softer corners, and Clay and Clay Dark use rounded corners. Other built-in
 themes retain the defaults.
 
@@ -202,7 +252,10 @@ pills when `on_accent` has less than 4.5:1 contrast with the fill. See the
 
 - **Import…** adds a theme file and turns it on. Importing a file with the same name again updates
   that theme. A file with an unknown colour name or a malformed colour is refused, and the message
-  names every problem.
+  names every problem. A theme shared as text imports the same way without a file: with the
+  Interface page open, press Ctrl+V (Cmd+V on a Mac), or right-click the Import tile and choose
+  **Paste theme**. Pasted text that isn't a theme is left alone. A theme file dropped on the tile
+  imports too.
 - **Export…** saves the theme on now as a complete file listing every colour and radius. It is a good starting
   point for your own theme.
 - **Remove** deletes the selected imported theme.
@@ -212,6 +265,20 @@ Command icons use the shared SVG palette.
 
 Imported themes are kept with your preferences, so they work in the browser app too. Colour
 vision modes still apply on top of any theme.
+
+#### Follow a theme file
+
+In the desktop app, **Follow a theme file** (under the themes) takes a theme file that another
+tool writes and keeps it as the theme: whenever the file changes, SolidCraft reloads it within
+about a second, and again when its window comes back to the front, without a restart. This suits
+tools that generate a colour scheme from your wallpaper or keep one scheme across your desktop
+and applications (pywal and matugen are two examples); have them write a `solidcraft-theme/1`
+file from a template. **Choose…** picks the file, **Stop following** (or choosing any theme)
+turns it off; it is off until you choose a file. Only a file that reads completely is applied:
+while it is being written, or if it is broken, missing or larger than 256 KiB, the last good
+theme stays on and the setting says why. `solidcraft --theme-file my-theme.json` follows a file
+for one run without changing your preferences. The browser app has no file to follow; import the
+theme there instead.
 
 Graphics › **Frame rate** shows frames per second in the view's bottom-right corner. Click it,
 or turn on **Frame rate details**, for the performance overlay:

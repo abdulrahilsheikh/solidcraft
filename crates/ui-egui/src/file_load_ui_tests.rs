@@ -189,14 +189,15 @@ fn update_links_names_the_design_it_reads_while_the_window_draws() {
     let dir = scratch("links");
     let part = dir.join("plate.solidcraft");
     let case = dir.join("case.solidcraft");
-    // A plate with two holes (three features: the read can be held at the third).
+    // A plate with two holes (three features: the read can be held at the third), saved without
+    // its model so reading it rebuilds the features.
     let save_part = |height: f64| {
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 40, "width": 20, "height": height})).unwrap();
         for x in [10, 30] {
             s.execute("solid.cylinder", &json!({"radius": 2, "height": 200, "base": [x, 10, -1], "operation": "cut"})).unwrap();
         }
-        s.execute("file.save", &json!({"path": part})).unwrap();
+        s.execute("file.save", &json!({"path": part, "cache": false})).unwrap();
         s.execute("inspect.measure", &json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap()
     };
     let volume = |app: &mut SolveApp| app.session.execute("inspect.measure", &json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
@@ -278,7 +279,7 @@ fn update_links_and_open_linked_design_ask_before_a_network_location() {
     let comp = h.app.run("component.insert_design", json!({"path": part})).unwrap()["component"].as_u64().unwrap();
     h.app.run("file.save", json!({"path": case})).unwrap();
     let feature = h.app.session.doc.links[&comp].feature;
-    h.app.session.doc_mut().links.insert(comp, solidcraft_engine::doc::DesignLink { path: crafted.into(), feature });
+    h.app.session.doc_mut().links.insert(comp, solidcraft_engine::doc::DesignLink { path: crafted.into(), feature, ..Default::default() });
     save_part(8.0);
     let until_idle = |h: &mut crate::scenario::Harness| {
         let began = std::time::Instant::now();
@@ -388,6 +389,9 @@ fn a_control_import_passes_up_and_names_on() {
     // The reply, the part's height and whether the offer is up, for an import by this window.
     let import = |params: serde_json::Value| {
         let mut w = Win::new();
+        // This test is about the caller's `up`, not the note's lying-on-its-back guess (#7717): every
+        // file from another program gets the offer, as before.
+        w.app.preferences.stand_up_unknown = crate::prefs::StandUpUnknown::Ask;
         let (tx, rx) = std::sync::mpsc::channel();
         w.app.control_rx = Some(rx);
         let (req, reply_rx) = crate::control::ControlRequest::new("engine.execute", json!({"command": "file.insert_step", "params": params.clone()}));

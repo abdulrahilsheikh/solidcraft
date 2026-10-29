@@ -53,7 +53,7 @@ mod design_link;
 mod file;
 mod frame;
 mod gears;
-mod inspect;
+pub(crate) mod inspect;
 mod interference;
 pub(crate) mod joints;
 mod libraries;

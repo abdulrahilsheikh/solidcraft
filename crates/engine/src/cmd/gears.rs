@@ -18,7 +18,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("module, teeth, height? (or face_width), bore?, pressure_angle?, backlash?, reversed_backlash?, clearance?, head_tolerance?, profile_shift?, num_points?, simple?, root_fillet_radius?, head_fillet_radius?, helix_angle? (90° is straight), double_helix?, axle_hole?, axle_hole_size?, offset_hole?, offset_hole_offset?, offset_hole_size?, point?, name?"),
     CommandSpec::new("gears.resize", "Edit Gear Parameters", resize_atomic)
         .icon("scale")
-        .params("component: id|name; editable gear parameters as gears.insert"),
+        .params("component: id; editable gear parameters as gears.insert"),
 ];
 
 #[derive(Clone, Debug)]
@@ -1267,23 +1267,18 @@ fn gear_properties(g: &Gear) -> Value {
 fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let g = read_gear(p, None)?;
 
-    let count = s
-        .model
-        .state()
-        .bodies
-        .iter()
-        .filter(|body| body.name.starts_with(&format!("{} Gear M{} Z{}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth)))
-        .count();
+    let active = s.active_component;
+
+    let created = run(s, "component.create", json!({"name": format!("{} Gear", if g.internal_gear { "Internal" } else { "Spur" })}))?;
+    let component = created["component"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no component id"))?;
+    let occurrence = created["occurrence"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no occurrence id"))?;
 
     let name = str_(p, "name")
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{} Gear M{} Z{} - {}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth, count + 1));
+        .unwrap_or_else(|| format!("{} Gear M{} Z{} #{}", if g.internal_gear { "Internal" } else { "Spur" }, g.module, g.teeth, component));
 
-    let active = s.active_component;
+    run(s, "component.rename", json!({"component": component, "name": name}))?;
 
-    let created = run(s, "component.create", json!({"name": name}))?;
-    let component = created["component"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no component id"))?;
-    let occurrence = created["occurrence"].as_u64().ok_or_else(|| bad("gears.insert", "component creation returned no occurrence id"))?;
     let body_name = unique_gear_body_name(s, component)?;
 
     build(s, &g, &body_name)?;
@@ -1328,15 +1323,18 @@ fn resize_atomic(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn resize(s: &mut Session, p: &Value) -> Result<Value> {
-    let key = match p.get("component") {
+    let component_key = match p.get("component") {
         Some(Value::Number(n)) => n.to_string(),
-        Some(Value::String(name)) => name.clone(),
+        Some(Value::String(s)) => s.clone(),
         _ => {
-            return Err(bad("gears.resize", "`component` must be an id or name"));
+            return Err(bad("gears.resize", "`component` must be an id"));
         }
     };
 
-    let component = s.doc.find_component(&key).ok_or_else(|| bad("gears.resize", format!("no component `{key}`")))?;
+    let component = s
+        .doc
+        .find_component(&component_key)
+        .ok_or_else(|| bad("gears.resize", format!("no component `{component_key}`")))?;
 
     let part = s
         .doc

@@ -32,8 +32,17 @@ struct RenderBrowserControls {
 }
 
 const RENDER_SELECT: TypedContract<RenderSelect> = TypedContract::new();
+const STATUS_ITEMS_CONTRACT: TypedContract<crate::schema::view_navigation::StatusItemsParams> = TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[
+CommandSpec::new("view.status_details", "Viewport Status Details", crate::checked!("view.status_details", status_details))
+    .icon("list").noundo().doc_only()
+    .contract(&STATUS_ITEMS_CONTRACT).output(output_schema_for::<crate::status_details::StatusDetails>)
+    .params("no parameters → current effect settings/detail capabilities and retained per-seam Continuity diagnostics, with current geometry validity; read-only, no evaluation"),
+CommandSpec::new("view.status_items", "Viewport Status Items", crate::checked!("view.status_items", status_items))
+    .icon("list").noundo().doc_only()
+    .contract(&STATUS_ITEMS_CONTRACT).output(output_schema_for::<crate::status_items::StatusItems>)
+    .params("no parameters → {items}; persistent viewport effects, oldest slot first, with structured settings and executable clear requests; read-only, no model evaluation"),
 CommandSpec::new("view.fit", "Fit", fit)
     .icon("fit").key("F6").noundo().doc_only().params("no parameters → frame the active canvas or selection; display only"),
 CommandSpec::new("view.home", "Home view", home)
@@ -181,6 +190,23 @@ fn normal_target(s: &Session) -> Option<(solidcraft_geom::Vec3, solidcraft_geom:
     })
 }
 
+fn status_details(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = if p.is_null() { json!({}) } else { p.clone() };
+    if !p.as_object().is_some_and(|object| object.is_empty()) {
+        return Err(bad("view.status_details", "parameters must be an empty object"));
+    }
+    let _: crate::schema::view_navigation::StatusItemsParams = serde_json::from_value(p).map_err(|e| bad("view.status_details", e.to_string()))?;
+    let items =
+        s.status_items().into_iter().map(|source| crate::status_details::StatusDetailItem { has_details: source.has_details(), source }).collect();
+    serde_json::to_value(crate::status_details::StatusDetails {
+        document_id: s.document_id.clone(),
+        items,
+        continuity: s.continuity_details(),
+        param_warnings: Vec::new(),
+    })
+    .map_err(|e| bad("view.status_details", e.to_string()))
+}
+
 fn normal_to(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "view.normal_to";
     let (point, normal) = normal_target(s).ok_or_else(|| bad(cmd, "select a planar face or plane"))?;
@@ -268,6 +294,15 @@ fn ground_shadow(_s: &mut Session, p: &Value) -> Result<Value> {
 }
 fn navigation_bar(_s: &mut Session, p: &Value) -> Result<Value> {
     view_toggle(p, "view.navigation_bar", "visible")
+}
+
+fn status_items(s: &mut Session, p: &Value) -> Result<Value> {
+    if !p.is_object() {
+        return Err(bad("view.status_items", "parameters must be an empty object"));
+    }
+    let _: crate::schema::view_navigation::StatusItemsParams =
+        serde_json::from_value(p.clone()).map_err(|e| bad("view.status_items", e.to_string()))?;
+    Ok(json!(crate::status_items::StatusItems { items: s.status_items() }))
 }
 
 fn render_focus(_s: &mut Session, p: &Value) -> Result<Value> {

@@ -81,6 +81,13 @@ pub fn grouped_commands<'a>(tab: &str, panel: &str, commands: &[&'a CommandSpec]
     out
 }
 
+/// The ids of a panel's commands that are in none of its groups: [`grouped_commands`] puts them
+/// last, without a heading.
+pub fn ungrouped(tab: &str, panel: &str, commands: &[&CommandSpec]) -> Vec<&'static str> {
+    let groups = groups(tab, panel);
+    commands.iter().map(|c| c.id).filter(|id| !groups.iter().any(|g| g.ids.contains(id))).collect()
+}
+
 pub struct Section {
     pub tab: &'static str,
     pub panel: &'static str,
@@ -94,15 +101,16 @@ pub struct Section {
 const CONFIGURE: &[&str] = &["parameters.change", "config.table", "config.configure"];
 
 /// Commands that stay for agents, MCP and scripts but are not offered to people: the sketch solves
-/// itself after every edit, so a Solve button (and the search hit for it) only confuses.
-pub const AGENT_ONLY: &[&str] = &["sketch.solve"];
+/// itself after every edit, so a Solve button (and the search hit for it) only confuses; drawn 3D
+/// points are moved with the triad that appears when one is clicked, not a Move button.
+pub const AGENT_ONLY: &[&str] = &["sketch.solve", "sketch.move3d"];
 
 pub const SECTIONS: &[Section] = &[
     Section {
         tab: "MODEL",
         panel: "SKETCH",
         promoted: 1,
-        ids: &["sketch.create", "sketch.edit", "sketch.line3d", "sketch.arc3d", "sketch.spline3d", "sketch.point3d", "sketch.move3d"],
+        ids: &["sketch.create", "sketch.edit", "sketch.line3d", "sketch.arc3d", "sketch.spline3d", "sketch.point3d"],
     },
     Section { tab: "MODEL", panel: "CREATE", promoted: 3, ids: &["solid.extrude", "solid.revolve", "solid.hole"] },
     Section {
@@ -152,8 +160,8 @@ pub const SECTIONS: &[Section] = &[
     Section {
         tab: "ASSEMBLE",
         panel: "POSITION",
-        promoted: 3,
-        ids: &["occurrence.ground", "component.capture_position", "component.revert_position"],
+        promoted: 4,
+        ids: &["occurrence.move", "occurrence.ground", "component.capture_position", "component.revert_position"],
     },
     Section {
         tab: "ASSEMBLE",
@@ -250,8 +258,15 @@ pub const SECTIONS: &[Section] = &[
     Section {
         tab: "SKETCH",
         panel: "CREATE",
-        promoted: 4,
-        ids: &["sketch.line", "sketch.rectangle.two_point", "sketch.circle.center", "sketch.arc.three_point", "sketch.infinite"],
+        promoted: 5,
+        ids: &[
+            "sketch.line",
+            "sketch.rectangle.two_point",
+            "sketch.circle.center",
+            "sketch.arc.three_point",
+            "sketch.construction_line",
+            "sketch.infinite",
+        ],
     },
     Section {
         tab: "SKETCH",
@@ -295,6 +310,7 @@ pub const SECTIONS: &[Section] = &[
         ],
     },
     // Sketch dimensions are driven by parameters, so they are one click away while sketching.
+    Section { tab: "SKETCH", panel: "INSPECT", promoted: 1, ids: &["sketch.inspect"] },
     Section { tab: "SKETCH", panel: "CONFIGURE", promoted: 2, ids: CONFIGURE },
     Section { tab: "SKETCH", panel: "FINISH SKETCH", promoted: 2, ids: &["sketch.finish", "sketch.cancel"] },
     // New Sketch leads the tab, as on MODEL: a sheet part starts from a sketch (#3250).
@@ -417,6 +433,7 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("inspect.zebra", "Zebra"),
     ("joint.as_built", "As-Built"),
     ("material.assign", "Material"),
+    ("occurrence.move", "Move"),
     ("parameters.change", "Parameters"),
     ("parameters.graph", "Param. Graph"),
     ("parts.fastener", "Fastener"),
@@ -435,9 +452,11 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("sketch.circle.center", "Circle"),
     ("sketch.constraint.coincident", "Coincident"),
     ("sketch.constraint.horizontal_vertical", "Horiz./Vert."),
+    ("sketch.construction_line", "X-Lines"),
     ("sketch.create", "New Sketch"),
     ("sketch.dimension", "Dimension"),
     ("sketch.finish", "Finish Sketch"),
+    ("sketch.inspect", "Sketch Report"),
     ("sketch.pattern.circular", "Circular"),
     ("sketch.pattern.rectangular", "Rectangular"),
     ("sketch.rectangle.two_point", "Rectangle"),
@@ -453,6 +472,11 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
 
 pub fn ribbon_button_label(command: &CommandSpec) -> &str {
     RIBBON_LABELS.iter().find(|(id, _)| *id == command.id).map_or(command.label, |(_, label)| *label)
+}
+
+/// Families keep their full menu title while using the first command's compact ribbon name.
+pub fn ribbon_family_label(family: &crate::sketch_families::Family) -> &'static str {
+    family.commands.first().and_then(|first| RIBBON_LABELS.iter().find(|(id, _)| id == first)).map_or(family.label, |(_, label)| *label)
 }
 
 /// Registry placement → default ribbon destination, after explicit id overrides.
@@ -729,19 +753,23 @@ pub fn sync_context(app: &mut crate::SolveApp) {
 
 pub fn select_command_tab(app: &mut crate::SolveApp, id: &str) {
     sync_context(app);
-    let Some(c) = solidcraft_engine::find_command(id) else { return };
+    if let Some(tab) = command_tab(app, id) {
+        app.ui.tab = tab.into();
+    }
+}
+
+/// The tab to switch to so the ribbon shows command `id`, or `None` to stay: the current tab
+/// already lists it, or its home tab can't be shown.
+pub fn command_tab(app: &crate::SolveApp, id: &str) -> Option<&'static str> {
+    let c = solidcraft_engine::find_command(id)?;
     // Keep the tab a toolbar click came from when it already lists this shared command.
     if crate::toolbar_custom::panel_lists(&app.ui.tab).iter().any(|(_, cmds, _)| cmds.iter().any(|c| c.id == id)) {
-        return;
+        return None;
     }
-    if let Some((tab, _)) = destination(c) {
-        if render_tab(tab) && !crate::render_workspace::active(app) {
-            return;
-        } // The Render workspace owns its entry/exit lifecycle.
-        if visible_tabs(app).contains(&tab) {
-            app.ui.tab = tab.into();
-        }
-    }
+    let (tab, _) = destination(c)?;
+    // The Render workspace owns its entry/exit lifecycle.
+    let render_closed = render_tab(tab) && !crate::render_workspace::active(app);
+    (!render_closed && visible_tabs(app).contains(&tab)).then_some(tab)
 }
 
 /// Defaults from the previous ribbon, used only to carry removals into the new layout.
@@ -846,6 +874,9 @@ mod tests {
         }
         assert_eq!(ribbon_button_label(solidcraft_engine::find_command("sketch.create").unwrap()), "New Sketch");
         assert_eq!(solidcraft_engine::find_command("sketch.create").unwrap().label, "Create Sketch");
+        let construction = crate::sketch_families::family("sketch.construction_line").unwrap();
+        assert_eq!(ribbon_family_label(construction), "X-Lines");
+        assert_eq!(construction.label, "Construction Line");
     }
 
     #[test]
@@ -856,7 +887,12 @@ mod tests {
             assert!(lists.iter().any(|(_, (cmds, _))| cmds.iter().any(|x| x.id == c.id)), "lost toolbar command {} ({}/{})", c.id, c.tab, c.panel);
         }
         for (s, (cmds, n)) in lists {
-            assert!(n <= 4 || (s.tab == "SKETCH" && s.panel == "CONSTRAIN" && n == 7), "{}/{} promotes {n} commands", s.tab, s.panel);
+            assert!(
+                n <= 4 || (s.tab == "SKETCH" && ((s.panel == "CONSTRAIN" && n == 7) || (s.panel == "CREATE" && n == 5))),
+                "{}/{} promotes {n} commands",
+                s.tab,
+                s.panel
+            );
             for id in s.ids {
                 assert!(specs.iter().any(|c| c.id == *id), "unknown layout id {id}");
             }
@@ -1445,5 +1481,15 @@ mod tests {
         h.frames(2);
         assert!(h.app.session.active_sketch.is_some());
         assert_eq!(h.app.ui.tab, "SKETCH");
+    }
+
+    /// Move 3D Point stays for agents, MCP and scripts; people move a drawn 3D point with the
+    /// triad that appears when it is clicked, not a ribbon button.
+    #[test]
+    fn move3d_is_agent_only() {
+        assert!(AGENT_ONLY.contains(&"sketch.move3d"), "sketch.move3d must stay available to agents");
+        for section in SECTIONS.iter().filter(|s| s.panel == "SKETCH") {
+            assert!(!section.ids.contains(&"sketch.move3d"), "{}/{} must not offer sketch.move3d on the ribbon", section.tab, section.panel);
+        }
     }
 }

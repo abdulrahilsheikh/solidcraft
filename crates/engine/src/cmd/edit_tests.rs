@@ -774,6 +774,45 @@ fn feature_names(s: &Session) -> Vec<String> {
     s.doc.features.iter().map(|feature| feature.name.clone()).collect()
 }
 
+#[test]
+fn timeline_keys_distinguish_numeric_names_from_ids() {
+    let mut s = four_boxes();
+    let id = s.doc.find_feature("Second").unwrap().id;
+    let named = s.doc.find_feature("Third").unwrap().id;
+    let key = id.to_string();
+    run(&mut s, "timeline.rename", json!({"feature": named, "name": key}));
+
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"feature": key}))["id"], named);
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"feature": id}))["id"], id);
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"feature": named.to_string()}))["id"], named);
+    assert_eq!(run(&mut s, "timeline.copy", json!({"features": [key, id]}))["copied"], json!(["Second", key]));
+
+    // Resolve the whole request before deleting: a repeated name must not turn into an id
+    // after the first deletion removes the feature with that name.
+    assert_eq!(run(&mut s, "timeline.delete", json!({"features": [key, key]}))["deleted"], json!([named]));
+    assert!(s.doc.feature(id).is_some());
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "selection.delete", json!({"items": [Sel::Feature { id }]}));
+    assert!(s.doc.feature(id).is_none());
+    assert!(s.doc.feature(named).is_some());
+}
+
+#[test]
+fn timeline_keys_prefer_exact_case_and_refuse_an_ambiguous_fallback() {
+    let mut s = four_boxes();
+    let second = s.doc.find_feature("Second").unwrap().id;
+    let third = s.doc.find_feature("Third").unwrap().id;
+    run(&mut s, "timeline.rename", json!({"feature": third, "name": "second"}));
+
+    let before = s.doc.clone();
+    let error = s.execute("timeline.delete", &json!({"features": ["First", "SECOND"]})).unwrap_err().to_string();
+    assert!(error.contains("ambiguous"), "{error}");
+    assert_eq!(s.doc, before);
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"feature": "Second"}))["id"], second);
+    assert_eq!(run(&mut s, "timeline.suppress", json!({"feature": "second"}))["feature"], third);
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"feature": "FIRST"}))["name"], "First");
+}
+
 /// `timeline.delete {groups}` deletes a folder with its features and nested folders in one undo
 /// step; other folders and features stay, and `timeline.ungroup` still keeps the features (#7219).
 #[test]
@@ -1069,6 +1108,57 @@ fn counted_body_names_stay_when_the_timeline_changes() {
     assert_eq!(bodies(&s), named(&[("Body2", "B"), ("Body3", "C"), ("Body4", "E")]));
 }
 
+/// Pinning reads each feature's bodies once and keeps them with the state it read them from;
+/// the names it pins and reserves, and the fingerprints it leaves, are those of reading every
+/// feature's bodies again: random boxes (named and counted), moves, suppressions, deletions,
+/// reorders, undo and redo, against a session that forgets what it read before every command and
+/// against fingerprinting the whole timeline again.
+#[test]
+fn pinning_with_the_bodies_it_read_before_pins_as_reading_them_again() {
+    let (mut kept, mut fresh) = (Session::default(), Session::default());
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    for step in 0..60 {
+        let features: Vec<String> = kept.doc.features.iter().map(|f| f.name.clone()).collect();
+        let counted: Vec<String> = kept.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+        let pick = |names: &[String], k: usize| names.get(k % names.len().max(1)).cloned().unwrap_or_default();
+        let x = 15 * step;
+        let (id, params) = match next(9) {
+            _ if features.len() < 3 => ("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0]})),
+            0 | 1 => ("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0]})),
+            2 => ("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0], "body_name": format!("Named {step}")})),
+            3 => ("solid.move", json!({"bodies": [pick(&counted, next(64))], "translate": [0, 5, 0]})),
+            4 => ("timeline.suppress", json!({"feature": pick(&features, next(64)), "suppressed": next(2) == 0})),
+            5 => ("timeline.delete", json!({"feature": pick(&features, next(64))})),
+            6 => ("timeline.reorder", json!({"feature": pick(&features, next(64)), "position": next(features.len()), "active": true})),
+            7 => ("edit.undo", json!({})),
+            _ => ("edit.redo", json!({})),
+        };
+        fresh.made_bodies.clear();
+        let (a, b) = (kept.execute(id, &params), fresh.execute(id, &params));
+        assert_eq!(a.is_ok(), b.is_ok(), "step {step}: {id} {params}");
+        assert_eq!(kept.doc.to_json(), fresh.doc.to_json(), "step {step}: {id} {params}");
+        // The fingerprints match the design as fingerprinting the whole timeline again makes them
+        // match it: evaluating it again reuses the same results (all, as a rule; the others are
+        // computed or taken from the cache the copies share).
+        let again = |model: &solidcraft_doc::Model| {
+            let mut m = model.clone();
+            m.evaluate(&kept.doc);
+            m.last_recomputed + m.last_restored
+        };
+        let mut full = kept.model.clone();
+        full.refingerprint(&kept.doc);
+        assert_eq!(again(&kept.model), again(&full), "step {step}: {id} {params}");
+        assert_eq!(again(&kept.model), again(&fresh.model), "step {step}: {id} {params}");
+    }
+    assert!(kept.doc.features.len() > 5 && !kept.doc.reserved_body_names.is_empty());
+}
+
 /// The value at a dotted path of a definition.
 fn dotted<'a>(def: &'a Value, path: &str) -> &'a Value {
     path.split('.').fold(def, |v, k| &v[k])
@@ -1353,4 +1443,87 @@ fn a_move_before_a_long_history_of_one_body_fits_a_window_threads_stack() {
         .unwrap()
         .join();
     assert!(moved.is_ok());
+}
+
+#[test]
+fn timeline_joint_folders_are_mixed_saved_and_undoable() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY", "name":"Profile"}));
+    run(&mut s, "component.create", json!({"name":"Part"}));
+    let joint = run(&mut s, "joint.as_built", json!({"type":"revolute", "a":0, "b":"Part", "name":"Hinge"}))["joint"].as_u64().unwrap();
+    let folder = run(&mut s, "timeline.group", json!({"name":"Mixed", "features":["Profile"], "joints":["Hinge", joint]}))["group"].as_u64().unwrap();
+    assert_eq!(s.doc.timeline_groups[0].joints, [joint]);
+    assert_eq!(s.doc.timeline_groups[0].features.len(), 1);
+    assert_eq!(run(&mut s, "timeline.inspect", json!({"group":folder}))["joints"], json!([joint]));
+    let saved = s.doc.to_json();
+    let reopened = solidcraft_doc::Document::from_json(&saved).unwrap();
+    assert_eq!(reopened.to_json(), saved);
+    let mut damaged: Value = serde_json::from_str(&saved).unwrap();
+    damaged["timeline_groups"][0]["joints"] = json!([u64::MAX]);
+    assert!(solidcraft_doc::Document::from_json(&damaged.to_string()).is_err());
+    damaged["timeline_groups"][0]["joints"] = json!([joint, joint]);
+    assert!(solidcraft_doc::Document::from_json(&damaged.to_string()).is_err());
+    let destination = run(&mut s, "timeline.group", json!({"name":"Destination"}))["group"].as_u64().unwrap();
+    run(&mut s, "timeline.move_to_group", json!({"joints":[joint], "group":destination}));
+    assert!(s.doc.timeline_groups[0].joints.is_empty());
+    assert_eq!(s.doc.timeline_groups[1].joints, [joint]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.timeline_groups[0].joints, [joint]);
+    // Both contents of a nested folder participate in the same toggle and undo.
+    run(&mut s, "timeline.move_to_group", json!({"groups":[folder], "group":destination}));
+    let before = s.doc.clone();
+    run(&mut s, "timeline.suppress", json!({"groups":[destination]}));
+    assert!(s.doc.features[0].suppressed && s.doc.assembly.joints[0].suppressed);
+    run(&mut s, "timeline.suppress", json!({"groups":[destination]}));
+    assert!(!s.doc.features[0].suppressed && !s.doc.assembly.joints[0].suppressed);
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.doc.features[0].suppressed && s.doc.assembly.joints[0].suppressed);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(*s.doc, *before);
+    run(&mut s, "timeline.delete", json!({"groups":[destination]}));
+    assert!(s.doc.features.is_empty() && s.doc.assembly.joints.is_empty() && s.doc.timeline_groups.is_empty());
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(*s.doc, *before);
+    run(&mut s, "timeline.ungroup", json!({"group":folder}));
+    assert_eq!(s.doc.timeline_groups[0].joints, [joint], "contents promote to the surviving parent");
+    run(&mut s, "timeline.ungroup", json!({"group":destination}));
+    assert!(s.doc.timeline_groups.is_empty());
+    assert_eq!(s.doc.assembly.joints[0].id, joint);
+    let folder = run(&mut s, "timeline.group", json!({"joints":vec![joint; 10_000]}))["group"].as_u64().unwrap();
+    assert_eq!(s.doc.timeline_groups[0].joints, [joint], "the 10000-entry cap is inclusive and deduplicated");
+    run(&mut s, "timeline.move_to_group", json!({"joints":["Hinge"], "group":null}));
+    assert!(s.doc.timeline_groups[0].joints.is_empty());
+    run(&mut s, "timeline.move_to_group", json!({"joints":["Hinge"], "group":folder}));
+    run(&mut s, "timeline.suppress", json!({"groups":[folder]}));
+    assert!(s.doc.assembly.joints[0].suppressed, "joint-only folders suppress too");
+    run(&mut s, "joint.delete", json!({"joint":joint}));
+    assert!(s.doc.timeline_groups[0].joints.is_empty());
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.timeline_groups[0].joints, [joint]);
+    run(&mut s, "component.delete", json!({"component":"Part"}));
+    assert!(s.doc.assembly.joints.is_empty());
+    assert!(s.doc.timeline_groups[0].joints.is_empty());
+    assert!(solidcraft_doc::Document::from_json(&s.doc.to_json()).is_ok());
+}
+
+#[test]
+fn timeline_joint_folders_reject_hostile_joint_references_atomically() {
+    let mut s = Session::default();
+    run(&mut s, "component.create", json!({"name":"Part"}));
+    let joint = run(&mut s, "joint.as_built", json!({"type":"rigid", "a":0, "b":"Part"}))["joint"].as_u64().unwrap();
+    let folder = run(&mut s, "timeline.group", json!({}))["group"].as_u64().unwrap();
+    for command in ["timeline.group", "timeline.move_to_group"] {
+        for joints in
+            [json!([u64::MAX]), json!([-1]), json!([1e100]), json!(["missing"]), json!([{}]), json!([null]), json!("bad"), json!(vec![joint; 10_001])]
+        {
+            let before = s.doc.to_json();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.execute(command, &json!({"joints":joints, "group":folder}))));
+            let error = result.unwrap().unwrap_err();
+            assert!(
+                matches!(&error, crate::EngineError::BadParams { .. }),
+                "{command} must reject invalid joint references without an internal panic: {error}"
+            );
+            assert_eq!(s.doc.to_json(), before);
+        }
+    }
 }

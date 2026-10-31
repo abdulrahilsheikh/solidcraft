@@ -126,7 +126,8 @@ impl Gear {
     }
 
     fn effective_backlash(&self) -> f64 {
-        if self.reversed_backlash { -self.backlash } else { self.backlash }
+        let flip_for_internal_gear = if self.internal_gear { -1.00 } else { 1.00 };
+        if self.reversed_backlash { self.backlash * flip_for_internal_gear } else { -self.backlash * flip_for_internal_gear }
     }
 
     fn involute_segments(&self) -> usize {

@@ -686,7 +686,13 @@ fn gear_outline(g: &Gear) -> Result<Vec<[f64; 2]>> {
 fn add_profile_loops(s: &mut Session, g: &Gear, name: &str) -> Result<()> {
     run(s, "sketch.edit", json!({"sketch": name}))?;
     if g.internal_gear {
-        run(s, "sketch.circle.center", json!({"center": [0.0, 0.0], "radius": g.outside_radius() + g.rim_thickness}))?;
+        run(
+            s,
+            "sketch.circle.center",
+            json!({"center": [0.0, 0.0], "radius": g.outside_radius() + g.rim_thickness,
+             "ids": ["internal_gear_profile"]
+            }),
+        )?;
     } else {
         if g.axle_hole && g.bore > 0.0 {
             run(s, "sketch.circle.center", json!({"center": [0.0, 0.0], "radius": g.bore / 2.0}))?;
@@ -719,7 +725,9 @@ fn sector_sketch(s: &mut Session, g: &Gear, start: f64, start_rotation: f64, nam
     add_profile_loops(s, g, name)?; // the only place loops are added
     Ok(name.to_string())
 }
-
+fn internal_rim_point(g: &Gear) -> [f64; 2] {
+    [g.outside_radius() + g.rim_thickness / 2.0, 0.0]
+}
 fn helical_sweep(
     s: &mut Session,
     g: &Gear,
@@ -739,7 +747,7 @@ fn helical_sweep(
     run(s, "sketch.line", json!({"points": [[0, -start], [0, -end]], "closed": false, "ids": [path_id]}))?;
     run(s, "sketch.finish", json!({}))?;
 
-    let params = json!({
+    let mut params = json!({
         "sketch": profile_name,
         "path_sketch": path_name,
         "path": [path_id],
@@ -747,8 +755,12 @@ fn helical_sweep(
         "operation": operation,
         "name": format!("Helical gear {suffix}"),
         "body_name": body_name,
-    });
 
+    });
+    if g.internal_gear {
+        params["profiles"] = json!([{"point": internal_rim_point(g)}])
+    }
+    eprintln!("{}", params);
     run(s, "solid.sweep", params).map_err(|e| bad("gears", format!("helical gear sweep failed: {e}")))?;
     Ok(())
 }
